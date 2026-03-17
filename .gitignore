@@ -2,3 +2,5 @@
 .DS_Store
 papers
 data
+docs
+build/

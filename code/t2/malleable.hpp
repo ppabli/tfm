@@ -1,21 +1,72 @@
 #pragma once
 
 #include <mpi.h>
-#include <atomic>
+#include <cstddef>
 #include <cstdio>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #ifndef MAL_INITIAL_SIZE
+
 	#define MAL_INITIAL_SIZE 1
+
 #endif
 
 #ifndef MAL_EPOCH_INTERVAL_MS
+
 	#define MAL_EPOCH_INTERVAL_MS 3000
+
 #endif
+
+#ifndef MAL_LOG_LEVEL
+
+	#define MAL_LOG_LEVEL MAL_LOG_INFO
+
+#endif
+
+int mal_rank();
+
+enum MalLogLevel {
+	MAL_LOG_DEBUG,
+	MAL_LOG_INFO,
+	MAL_LOG_WARN,
+	MAL_LOG_ERROR,
+};
+
+const char* mal_log_level_name(MalLogLevel level);
+const char* mal_log_level_color(MalLogLevel level);
+const char* mal_log_reset_color();
+
+#define MAL_LOG(level, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-6s][R%d] " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+#define MAL_LOG_L(level, tag, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-5s][%-6s][R%d] " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), (tag), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+
+struct MalVec;
+struct MalAcc;
+
+enum MalDimMode {
+	MAL_DIM_PARTITIONED,
+	MAL_DIM_SHARED,
+};
+
+enum MalHaloMode {
+	MAL_HALO_CLAMP,
+	MAL_HALO_ZERO,
+	MAL_HALO_PERIODIC,
+};
+
+enum MalAttachPolicy {
+	MAL_ATTACH_DEFAULT,
+	MAL_ATTACH_ONCE_ALL,
+};
+
+template<typename T> struct MpiType;
+template<> struct MpiType<int> { static MPI_Datatype value() { return MPI_INT; } };
+template<> struct MpiType<long> { static MPI_Datatype value() { return MPI_LONG; } };
+template<> struct MpiType<long long> { static MPI_Datatype value() { return MPI_LONG_LONG; } };
+template<> struct MpiType<unsigned> { static MPI_Datatype value() { return MPI_UNSIGNED; } };
+template<> struct MpiType<unsigned long> { static MPI_Datatype value() { return MPI_UNSIGNED_LONG; } };
+template<> struct MpiType<float> { static MPI_Datatype value() { return MPI_FLOAT; } };
+template<> struct MpiType<double> { static MPI_Datatype value() { return MPI_DOUBLE; } };
 
 struct MalFor {
 
@@ -24,75 +75,79 @@ struct MalFor {
 	long current{0};
 	long* user_iter{nullptr};
 	long* user_limit{nullptr};
+
 	std::vector<std::pair<long,long>> extra_ranges;
+	std::vector<long> extra_range_local_bases;
+	size_t extra_idx{0};
+	long range_local_base{0};
+
+	std::vector<std::pair<long,long>> plan_ranges;
+	std::vector<long> plan_local_bases;
+
+	std::vector<MalVec*> vecs;
+	std::vector<MalAcc*> accs;
 
 	MalFor() = default;
 	MalFor(const MalFor&) = delete;
 	MalFor& operator=(const MalFor&) = delete;
-	MalFor(MalFor&& o) noexcept : start(o.start), end(o.end), current(o.current), user_iter(std::exchange(o.user_iter, nullptr)), user_limit(std::exchange(o.user_limit, nullptr)), extra_ranges(std::move(o.extra_ranges)) {}
+	MalFor(MalFor&&) noexcept = default;
 	MalFor& operator=(MalFor&&) = delete;
 
 };
 
-struct MalReduce : MalFor {
-
-	long* user_acc{nullptr};
-	long global_acc{0};
-	int result_rank{0};
-	bool result_done{false};
-
-	MalReduce() = default;
-	~MalReduce();
-	MalReduce(const MalReduce&) = delete;
-	MalReduce& operator=(const MalReduce&) = delete;
-	MalReduce(MalReduce&& o) noexcept : MalFor(std::move(o)), user_acc(std::exchange(o.user_acc, nullptr)), global_acc(o.global_acc), result_rank(o.result_rank), result_done(std::exchange(o.result_done, true)) {}
-	MalReduce& operator=(MalReduce&&) = delete;
-
-};
-
-struct MalState {
-
-	MPI_Session session{MPI_SESSION_NULL};
-	MPI_Group world_group{MPI_GROUP_NULL};
-	MPI_Comm universe_comm{MPI_COMM_NULL};
-	int universe_rank{-1};
-
-	MPI_Comm active_comm{MPI_COMM_NULL};
-	int current_rank{-1};
-	int current_size{0};
-
-	std::thread mal_thread;
-
-	std::atomic<bool> should_stop{false};
-	std::atomic<bool> secure_synchronization{false};
-	std::atomic<bool> waiting_for_resize{false};
-
-	std::mutex compute_thread_mutex;
-	std::condition_variable compute_thread_cv;
-
-	MalFor* active_loop{nullptr};
-	MalReduce* active_reduce{nullptr};
-
-	std::vector<std::pair<long,long>> pending_ranges;
-	long pending_global_acc{0};
-
-	MalState() noexcept {}
-	MalState(const MalState&) = delete;
-	MalState& operator=(const MalState&) = delete;
-
-};
-
-extern MalState mal_state;
-
-#define MAL_LOG(tag, fmt, ...) printf("[%8.3f][%-6s][R%d] " fmt "\n", MPI_Wtime(), (tag), mal_state.universe_rank, ##__VA_ARGS__)
-
 void mal_init();
 void mal_finalize();
 
-MalFor mal_for(long total_iters, long& iter, long& limit);
-MalReduce mal_for_reduce(long total_iters, long& iter, long& limit, long& acc, int result_rank = 0);
+void mal_set_epoch_interval_ms(int ms);
+void mal_set_resize_enabled(bool enabled);
+void mal_set_resize_sequence(const int* seq, size_t count);
+void mal_reset_resize_sequence_default();
 
+[[nodiscard]] MalFor mal_for(long total_iters, long& iter, long& limit);
 void mal_check_for(MalFor& f);
-void mal_check_reduce(MalReduce& r);
 
-void mal_reduce_result(MalReduce& r);
+void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT);
+
+namespace detail {
+
+	struct AccDesc {
+
+		void* ptr;
+		MPI_Datatype dtype;
+		MPI_Op dop;
+		size_t esz;
+		void (*fn_get) (const void* p, void* dst);
+		void (*fn_set) (void* p, const void* src);
+		void (*fn_add) (void* p, const void* src);
+		void (*fn_reset)(void* p);
+
+	};
+
+	void acc_register(MalFor& f, AccDesc d, int result_rank);
+
+}
+
+template<typename T>
+inline void mal_attach_acc(MalFor& f, T& acc, MPI_Datatype dtype, MPI_Op op, int result_rank = 0) {
+
+	detail::acc_register(f, {
+		&acc, dtype, op, sizeof(T),
+		[](const void* p, void* d) { *static_cast<T*>(d) = *static_cast<const T*>(p); },
+		[](void* p, const void* s) { *static_cast<T*>(p) = *static_cast<const T*>(s); },
+		[](void* p, const void* s) { *static_cast<T*>(p) += *static_cast<const T*>(s); },
+		[](void* p) { *static_cast<T*>(p) = T{}; },
+	}, result_rank);
+
+}
+
+template<typename T>
+inline void mal_attach_acc(MalFor& f, T& acc, int result_rank = 0) {
+
+	mal_attach_acc(f, acc, MpiType<T>::value(), MPI_SUM, result_rank);
+
+}
+
+void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT);
+
+void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_DEFAULT);
+void mal_exchange_halo(MalFor& f);
