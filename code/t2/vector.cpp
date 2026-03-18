@@ -1,12 +1,12 @@
 #include <cstdlib>
-#include <cstdio>
+#include <cstring>
 #include <mpi.h>
 #include <unistd.h>
 #include "malleable.hpp"
 
 #define MAL_N 20
 
-int main(int /*argc*/, char* /*argv*/[]) {
+int main(int argc, char* argv[]) {
 
 	mal_init();
 
@@ -27,22 +27,62 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 	}
 
-	long i, limit;
-	MalFor f = mal_for(MAL_N, i, limit);
+	bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
 
-	mal_attach_vec(f, (void**)&A, sizeof(double), MAL_N, -1);
-	mal_attach_vec(f, (void**)&B, sizeof(double), MAL_N, -1);
-	mal_attach_vec(f, (void**)&C, sizeof(double), MAL_N,  0);
+	if (use_collapse) {
 
-	for (; i < limit; i++) {
+		long i, limit_rows, j, limit_cols;
 
-		C[i] = A[i] + B[i];
+		const long starts[2] = {0, 0};
+		const long limits2d[2] = {4, 5};
 
-		MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
+		long* iters[2] = {&i, &j};
+		long* loop_limits[2] = {&limit_rows, &limit_cols};
 
-		usleep(1000 * 1000 * 2);
+		MalForND nd = mal_for_nd_begin(iters, loop_limits, starts, limits2d, 2);
 
-		mal_check_for(f);
+		mal_attach_vec(nd, (void**)&A, sizeof(double), MAL_N, -1);
+		mal_attach_vec(nd, (void**)&B, sizeof(double), MAL_N, -1);
+		mal_attach_vec(nd, (void**)&C, sizeof(double), MAL_N,  0);
+
+		for (; i < limit_rows; i++) {
+
+			for (; j < limit_cols; j++) {
+
+				long idx = i * limit_cols + j;
+				C[idx] = A[idx] + B[idx];
+
+				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", idx, A[idx], B[idx], C[idx]);
+
+				usleep(1000 * 1000 * 2);
+
+				mal_check_for(nd);
+
+			}
+
+		}
+
+	} else {
+
+		long i, limit;
+
+		MalFor f = mal_for(MAL_N, i, limit);
+
+		mal_attach_vec(f, (void**)&A, sizeof(double), MAL_N, -1);
+		mal_attach_vec(f, (void**)&B, sizeof(double), MAL_N, -1);
+		mal_attach_vec(f, (void**)&C, sizeof(double), MAL_N,  0);
+
+		for (; i < limit; i++) {
+
+			C[i] = A[i] + B[i];
+
+			MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
+
+			usleep(1000 * 1000 * 2);
+
+			mal_check_for(f);
+
+		}
 
 	}
 
@@ -80,4 +120,3 @@ int main(int /*argc*/, char* /*argv*/[]) {
 	return EXIT_SUCCESS;
 
 }
-

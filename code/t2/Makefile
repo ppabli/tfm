@@ -25,7 +25,7 @@ SRCS_CONV = malleable.cpp convolution.cpp
 OBJS_CONV = $(SRCS_CONV:%.cpp=$(BUILD_DIR)/%.o)
 DEPS = $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MM:.o=.d) $(OBJS_CONV:.o=.d)
 
-.PHONY: all run_montecarlo run_vector run_matmul run_convolution clean re
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmul run_convolution clean re
 
 all: $(TARGET_MC) $(TARGET_VEC) $(TARGET_MM) $(TARGET_CONV)
 
@@ -50,6 +50,9 @@ run_montecarlo: $(TARGET_MC)
 
 run_vector: $(TARGET_VEC)
 	$(MPIRUN) -n $(NP) ./$(TARGET_VEC)
+
+run_vector_collapse: $(TARGET_VEC)
+	$(MPIRUN) -n $(NP) ./$(TARGET_VEC) collapse
 
 run_matmul: $(TARGET_MM)
 	$(MPIRUN) -n $(NP) ./$(TARGET_MM) mm

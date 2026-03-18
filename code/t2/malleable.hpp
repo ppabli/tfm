@@ -3,6 +3,8 @@
 #include <mpi.h>
 #include <cstddef>
 #include <cstdio>
+#include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -59,6 +61,12 @@ enum MalAttachPolicy {
 	MAL_ATTACH_ONCE_ALL,
 };
 
+enum MalAttachExecMode {
+	MAL_ATTACH_INHERIT,
+	MAL_ATTACH_SYNC,
+	MAL_ATTACH_ASYNC,
+};
+
 template<typename T> struct MpiType;
 template<> struct MpiType<int> { static MPI_Datatype value() { return MPI_INT; } };
 template<> struct MpiType<long> { static MPI_Datatype value() { return MPI_LONG; } };
@@ -95,6 +103,14 @@ struct MalFor {
 
 };
 
+struct MalCollapseSpec {
+
+	std::vector<long> extents;
+	std::vector<long> strides;
+	long total_iters{0};
+
+};
+
 void mal_init();
 void mal_finalize();
 
@@ -102,11 +118,39 @@ void mal_set_epoch_interval_ms(int ms);
 void mal_set_resize_enabled(bool enabled);
 void mal_set_resize_sequence(const int* seq, size_t count);
 void mal_reset_resize_sequence_default();
+void mal_set_attach_exec_mode(MalAttachExecMode mode);
+[[nodiscard]] MalAttachExecMode mal_get_attach_exec_mode();
+void mal_wait_attach_tasks();
 
 [[nodiscard]] MalFor mal_for(long total_iters, long& iter, long& limit);
-void mal_check_for(MalFor& f);
+[[nodiscard]] MalCollapseSpec mal_make_collapse_spec(const long* extents, size_t ndims);
+[[nodiscard]] MalFor mal_for_collapse(const MalCollapseSpec& spec, long& iter, long& limit);
+void mal_collapse_decode(const MalCollapseSpec& spec, long flat_iter, long* indices_out);
 
-void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT);
+struct MalForND {
+
+	std::unique_ptr<MalFor> base;
+	MalCollapseSpec spec;
+	std::vector<long*> iter_vars;
+	std::vector<long*> limit_vars;
+	std::vector<long> starts;
+	std::vector<long> limits;
+	long flat{0};
+	long flat_limit{0};
+	bool done{true};
+
+};
+
+[[nodiscard]] MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* limits, size_t ndims);
+[[nodiscard]] MalForND mal_for_nd_begin(long* const* iter_vars, long* const* limit_vars, const long* starts, const long* limits, size_t ndims);
+[[nodiscard]] bool mal_for_nd_done(const MalForND& f);
+MalFor& mal_for_nd_base(MalForND& f);
+
+void mal_check_for(MalFor& f);
+void mal_check_for(MalForND& f);
+
+void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
 
 namespace detail {
 
@@ -147,7 +191,16 @@ inline void mal_attach_acc(MalFor& f, T& acc, int result_rank = 0) {
 
 }
 
-void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT);
+template<typename T>
+inline void mal_attach_acc(MalForND& f, T& acc, int result_rank = 0) {
 
-void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_DEFAULT);
+	mal_attach_acc(mal_for_nd_base(f), acc, result_rank);
+
+}
+
+void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+
+void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_halo(MalForND& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
 void mal_exchange_halo(MalFor& f);

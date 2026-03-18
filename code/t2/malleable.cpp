@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -214,9 +215,7 @@ struct MalState {
 
 	struct AsyncBcastTask {
 
-		void* buf{nullptr};
-		size_t bytes{0};
-		int root{0};
+		std::function<void()> run;
 		bool done{false};
 
 		std::mutex mu;
@@ -243,6 +242,7 @@ struct MalState {
 		size_t seq_idx{0};
 		std::atomic<int> epoch_ms{MAL_EPOCH_INTERVAL_MS};
 		std::atomic<bool> enabled{true};
+		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
 		std::mutex mu;
 
 	} cfg;
@@ -300,6 +300,7 @@ struct MalState {
 
 	std::mutex attach_mu;
 	std::deque<std::shared_ptr<AsyncBcastTask>> attach_tasks;
+	std::atomic<int> attach_inflight{0};
 
 	MalFor* loop{nullptr};
 
@@ -491,18 +492,24 @@ static void mpi_bcast_bytes(void* buf, size_t bytes, int root, MPI_Comm comm) {
 
 }
 
-static void run_async_bcast_once_all(void* buf, size_t bytes, int root = 0) {
+static bool use_async_attach_mode(MalAttachExecMode mode = MAL_ATTACH_INHERIT) {
 
-	if (g.comm.universe == MPI_COMM_NULL || bytes == 0) {
+	MalAttachExecMode effective = mode;
 
-		return;
+	if (effective == MAL_ATTACH_INHERIT) {
+
+		effective = g.cfg.attach_mode.load();
 
 	}
 
+	return effective == MAL_ATTACH_ASYNC;
+
+}
+
+static std::shared_ptr<MalState::AsyncBcastTask> enqueue_attach_task(std::function<void()> fn) {
+
 	auto task = std::make_shared<MalState::AsyncBcastTask>();
-	task->buf = buf;
-	task->bytes = bytes;
-	task->root = root;
+	task->run = std::move(fn);
 
 	{
 		std::lock_guard lk(g.attach_mu);
@@ -512,11 +519,55 @@ static void run_async_bcast_once_all(void* buf, size_t bytes, int root = 0) {
 
 	g.sync.notify();
 
+	return task;
+
+}
+
+static void wait_attach_task(const std::shared_ptr<MalState::AsyncBcastTask>& task) {
+
+	if (!task) {
+
+		return;
+
+	}
+
 	std::unique_lock lk(task->mu);
 	task->cv.wait(lk, [&] { return task->done || g.sync.stop.load(); });
 
 }
 
+void mal_wait_attach_tasks() {
+
+	std::unique_lock lk(g.sync.mu);
+	g.sync.cv.wait(lk, [] {
+
+		return (!g.sync.attach_pending.load() && g.attach_inflight.load() == 0) || g.sync.stop.load();
+
+	});
+
+}
+
+static void run_attach_bcast_once_all(void* buf, size_t bytes, int root = 0, bool wait = true) {
+
+	if (g.comm.universe == MPI_COMM_NULL || bytes == 0) {
+
+		return;
+
+	}
+
+	auto task = enqueue_attach_task([buf, bytes, root] {
+
+		mpi_bcast_bytes(buf, bytes, root, g.comm.universe);
+
+	});
+
+	if (wait) {
+
+		wait_attach_task(task);
+
+	}
+
+}
 
 static bool has_work_or_stop() {
 
@@ -734,6 +785,314 @@ static std::vector<int> make_displs(const std::vector<int>& counts) {
 	std::vector<int> d(counts.size());
 	std::exclusive_scan(counts.begin(), counts.end(), d.begin(), 0);
 	return d;
+
+}
+
+MalCollapseSpec mal_make_collapse_spec(const long* extents, size_t ndims) {
+
+	MalCollapseSpec spec;
+
+	if (!extents || ndims == 0) {
+
+		spec.total_iters = 0;
+
+		return spec;
+
+	}
+
+	spec.extents.assign(extents, extents + ndims);
+	spec.strides.assign(ndims, 1);
+
+	long total = 1;
+
+	for (size_t i = 0; i < ndims; ++i) {
+
+		if (spec.extents[i] < 0) {
+
+			spec.total_iters = 0;
+
+			return spec;
+
+		}
+
+		if (spec.extents[i] == 0) {
+
+			spec.total_iters = 0;
+
+			return spec;
+
+		}
+
+		if (total > LONG_MAX / spec.extents[i]) {
+
+			spec.total_iters = 0;
+
+			return spec;
+
+		}
+
+		total *= spec.extents[i];
+
+	}
+
+	spec.total_iters = total;
+
+	for (size_t i = ndims; i-- > 0;) {
+
+		if (i + 1 < ndims) {
+
+			spec.strides[i] = spec.strides[i + 1] * spec.extents[i + 1];
+
+		}
+
+	}
+
+	return spec;
+
+}
+
+MalFor mal_for_collapse(const MalCollapseSpec& spec, long& iter, long& limit) {
+
+	return mal_for(spec.total_iters, iter, limit);
+
+}
+
+void mal_collapse_decode(const MalCollapseSpec& spec, long flat_iter, long* indices_out) {
+
+	if (!indices_out || spec.extents.empty() || spec.strides.size() != spec.extents.size()) {
+
+		return;
+
+	}
+
+	if (flat_iter < 0) {
+
+		for (size_t i = 0; i < spec.extents.size(); ++i) {
+
+			indices_out[i] = 0;
+
+		}
+
+		return;
+
+	}
+
+	for (size_t i = 0; i < spec.extents.size(); ++i) {
+
+		long extent = spec.extents[i];
+		long stride = spec.strides[i];
+
+		if (extent <= 0 || stride <= 0) {
+
+			indices_out[i] = 0;
+
+			continue;
+
+		}
+
+		indices_out[i] = (flat_iter / stride) % extent;
+
+	}
+
+}
+
+MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* limits, size_t ndims) {
+
+	MalForND out;
+
+	if (!vars || !starts || !limits || ndims == 0) {
+
+		return out;
+
+	}
+
+	out.iter_vars.assign(vars, vars + ndims);
+	out.starts.assign(starts, starts + ndims);
+	out.limits.assign(limits, limits + ndims);
+
+	std::vector<long> extents(ndims, 0);
+
+	for (size_t d = 0; d < ndims; ++d) {
+
+		extents[d] = limits[d] - starts[d];
+
+		if (extents[d] < 0) {
+
+			extents[d] = 0;
+
+		}
+
+	}
+
+	out.spec = mal_make_collapse_spec(extents.data(), ndims);
+	out.base = std::make_unique<MalFor>(mal_for_collapse(out.spec, out.flat, out.flat_limit));
+
+	if (out.base) {
+
+		g.loop = out.base.get();
+
+	}
+
+	out.done = (out.flat >= out.flat_limit);
+
+	if (!out.done && out.iter_vars.size() == ndims) {
+
+		std::vector<long> idx(ndims, 0);
+		mal_collapse_decode(out.spec, out.flat, idx.data());
+
+		for (size_t d = 0; d < ndims; ++d) {
+
+			if (out.iter_vars[d]) {
+
+				*out.iter_vars[d] = out.starts[d] + idx[d];
+
+			}
+
+		}
+
+	}
+
+	return out;
+
+}
+
+MalForND mal_for_nd_begin(long* const* iter_vars, long* const* limit_vars, const long* starts, const long* limits, size_t ndims) {
+
+	MalForND out = mal_for_nd_begin(iter_vars, starts, limits, ndims);
+	out.limit_vars.assign(limit_vars, limit_vars + ndims);
+
+	for (size_t d = 0; d < ndims && d < out.limit_vars.size(); ++d) {
+
+		if (out.limit_vars[d]) {
+
+			*out.limit_vars[d] = out.limits[d];
+
+		}
+
+	}
+
+	return out;
+
+}
+
+bool mal_for_nd_done(const MalForND& f) {
+
+	return f.done || !f.base || f.flat >= f.flat_limit;
+
+}
+
+static void mal_for_nd_mark_done(MalForND& f) {
+
+	f.done = true;
+
+	for (size_t d = 0; d < f.iter_vars.size() && d < f.limits.size(); ++d) {
+
+		if (f.iter_vars[d]) {
+
+			*f.iter_vars[d] = f.limits[d];
+
+		}
+
+	}
+
+}
+
+void mal_check_for(MalForND& f) {
+
+	if (mal_for_nd_done(f)) {
+
+		return;
+
+	}
+
+	long current_flat = f.flat;
+
+	if (!f.iter_vars.empty() && f.iter_vars.size() == f.spec.extents.size()) {
+
+		current_flat = 0;
+
+		for (size_t d = 0; d < f.iter_vars.size(); ++d) {
+
+			if (!f.iter_vars[d]) {
+
+				continue;
+
+			}
+
+			long rel = *f.iter_vars[d] - f.starts[d];
+
+			if (rel < 0 || rel >= f.spec.extents[d]) {
+
+				continue;
+
+			}
+
+			current_flat += rel * f.spec.strides[d];
+
+		}
+
+		f.flat = current_flat;
+
+	}
+
+	mal_check_for(*f.base);
+
+	long scheduled_flat = f.flat;
+
+	if (scheduled_flat >= f.flat_limit) {
+
+		mal_for_nd_mark_done(f);
+
+		return;
+
+	}
+
+	long next_flat = scheduled_flat + 1;
+
+	if (next_flat >= f.flat_limit) {
+
+		mal_for_nd_mark_done(f);
+
+		return;
+
+	}
+
+	f.flat = next_flat;
+
+	std::vector<long> idx(f.spec.extents.size(), 0);
+	mal_collapse_decode(f.spec, next_flat, idx.data());
+
+	const size_t ndims = idx.size();
+
+	for (size_t d = 0; d < ndims; ++d) {
+
+		if (!f.iter_vars.empty() && d < f.iter_vars.size() && f.iter_vars[d]) {
+
+			if (d + 1 == ndims) {
+
+				*f.iter_vars[d] = f.starts[d] + idx[d] - 1;
+
+			} else {
+
+				*f.iter_vars[d] = f.starts[d] + idx[d];
+
+			}
+
+		}
+
+		if (!f.limit_vars.empty() && d < f.limit_vars.size() && f.limit_vars[d] && d < f.limits.size()) {
+
+			*f.limit_vars[d] = f.limits[d];
+
+		}
+
+	}
+
+}
+
+MalFor& mal_for_nd_base(MalForND& f) {
+
+	return *f.base;
 
 }
 
@@ -1167,13 +1526,21 @@ void Resizer::redistribute_vecs() {
 	}
 
 	bool will_receive_data = false;
+
 	if (am_receiver && my_new_count_ > 0) {
+
 		for (const auto& tr : plan) {
+
 			if (tr.new_rank == g.comm.u_rank) {
+
 				will_receive_data = true;
+
 				break;
+
 			}
+
 		}
+
 	}
 
 	if (will_receive_data) {
@@ -1215,20 +1582,20 @@ void Resizer::redistribute_vecs() {
 
 			const char* send_base = (t.v && was_active) ? static_cast<char*>(t.v->buf) + t.v->done_n * t.esz : nullptr;
 
-		if (tr.old_rank == tr.new_rank) {
+			if (tr.old_rank == tr.new_rank) {
 
-			if (tr.old_rank == g.comm.u_rank && send_base && t.gathered) {
+				if (tr.old_rank == g.comm.u_rank && send_base && t.gathered) {
 
-				long src_off = (tr.v_start - old_vs[g.comm.u_rank]) * (long)t.esz;
-				long dst_off = (tr.v_start - my_new_vs_ ) * (long)t.esz;
+					long src_off = (tr.v_start - old_vs[g.comm.u_rank]) * (long)t.esz;
+					long dst_off = (tr.v_start - my_new_vs_ ) * (long)t.esz;
 
-				std::memmove(t.gathered + dst_off, send_base + src_off, byte_count);
+					std::memmove(t.gathered + dst_off, send_base + src_off, byte_count);
+
+				}
+
+				continue;
 
 			}
-
-			continue;
-
-		}
 
 			if (tr.old_rank == g.comm.u_rank && send_base) {
 
@@ -1594,26 +1961,44 @@ static void progress_thread() {
 
 		for (;;) {
 
-			std::shared_ptr<MalState::AsyncBcastTask> task;
+			std::deque<std::shared_ptr<MalState::AsyncBcastTask>> batch;
 
 			{
 				std::lock_guard lk(g.attach_mu);
 				if (g.attach_tasks.empty()) {
 					g.sync.attach_pending = false;
+					g.sync.notify();
 					break;
 				}
-				task = g.attach_tasks.front();
-				g.attach_tasks.pop_front();
+				batch.swap(g.attach_tasks);
 			}
 
-			mpi_bcast_bytes(task->buf, task->bytes, task->root, g.comm.universe);
+			g.attach_inflight.fetch_add((int)batch.size());
 
-			{
-				std::lock_guard lk(task->mu);
-				task->done = true;
+			for (auto& task : batch) {
+
+				if (task && task->run) {
+
+					task->run();
+
+				}
+
+				if (task) {
+
+					{
+						std::lock_guard lk(task->mu);
+						task->done = true;
+					}
+
+					task->cv.notify_all();
+
+				}
+
+				g.sync.notify();
+
 			}
 
-			task->cv.notify_all();
+			g.attach_inflight.fetch_sub((int)batch.size());
 			g.sync.notify();
 
 		}
@@ -1631,6 +2016,12 @@ static void progress_thread() {
 		if (g.sync.stop) {
 
 			break;
+
+		}
+
+		if (g.sync.attach_pending.load() || g.attach_inflight.load() > 0) {
+
+			continue;
 
 		}
 
@@ -1704,6 +2095,27 @@ void mal_set_resize_enabled(bool b) {
 
 	g.cfg.enabled.store(b);
 	g.sync.notify();
+
+}
+
+void mal_set_attach_exec_mode(MalAttachExecMode mode) {
+
+	if (mode != MAL_ATTACH_SYNC && mode != MAL_ATTACH_ASYNC) {
+
+		MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring invalid attach execution mode=%d", (int)mode);
+
+		return;
+
+	}
+
+	g.cfg.attach_mode.store(mode);
+	g.sync.notify();
+
+}
+
+MalAttachExecMode mal_get_attach_exec_mode() {
+
+	return g.cfg.attach_mode.load();
 
 }
 
@@ -2018,6 +2430,8 @@ static void vec_gather(MalVec& v) {
 
 void mal_finalize() {
 
+	mal_wait_attach_tasks();
+
 	g.sync.stop = true;
 
 	g.sync.notify();
@@ -2251,7 +2665,7 @@ void mal_check_for(MalFor& f) {
 
 }
 
-void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy) {
+void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
 
 	auto vp = std::make_unique<MalVec>();
 	MalVec* v = vp.get();
@@ -2351,7 +2765,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 		}
 
-			run_async_bcast_once_all(v->buf, total_bytes, 0);
+		run_attach_bcast_once_all(v->buf, total_bytes, 0, !use_async_attach_mode(exec_mode));
 
 		if (g.comm.u_rank == 0 && orig && result_rank < 0) {
 
@@ -2361,19 +2775,37 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	} else if (!g.pending && g.comm.active != MPI_COMM_NULL) {
 
-		int do_scatter = (orig && result_rank < 0) ? 1 : 0;
+		const int do_scatter = (orig && result_rank < 0) ? 1 : 0;
+		const bool wait = !use_async_attach_mode(exec_mode);
 
-		MPI_Bcast(&do_scatter, 1, MPI_INT, 0, g.comm.active);
+		auto task = enqueue_attach_task([v, do_scatter, orig, result_rank] {
 
-		if (do_scatter) {
+			if (g.comm.active == MPI_COMM_NULL) {
 
-			vec_scatter(*v, orig);
-
-			if (g.comm.u_rank == 0) {
-
-				std::free(orig);
+				return;
 
 			}
+
+			int op = do_scatter;
+			MPI_Bcast(&op, 1, MPI_INT, 0, g.comm.active);
+
+			if (op) {
+
+				vec_scatter(*v, orig);
+
+				if (g.comm.u_rank == 0 && result_rank < 0 && orig) {
+
+					std::free(orig);
+
+				}
+
+			}
+
+		});
+
+		if (wait) {
+
+			wait_attach_task(task);
 
 		}
 
@@ -2384,6 +2816,12 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 		g.pending->vec_slices.clear();
 
 	}
+
+}
+
+void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+
+	mal_attach_vec(mal_for_nd_base(f), user_ptr, elem_size, total_N, result_rank, policy, exec_mode);
 
 }
 
@@ -2419,7 +2857,7 @@ void detail::acc_register(MalFor& f, detail::AccDesc d, int result_rank) {
 
 }
 
-void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank, MalAttachPolicy policy) {
+void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
 
 	if (elem_size == 0 || primary_n < 0 || secondary_n < 0) {
 
@@ -2429,7 +2867,8 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	if (policy == MAL_ATTACH_ONCE_ALL && mode == MAL_DIM_PARTITIONED && result_rank < 0) {
 
-		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, -1, MAL_ATTACH_ONCE_ALL);
+		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, -1, MAL_ATTACH_ONCE_ALL, exec_mode);
+
 		return;
 
 	}
@@ -2442,7 +2881,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	if (mode == MAL_DIM_PARTITIONED) {
 
-		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, result_rank, MAL_ATTACH_DEFAULT);
+		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, result_rank, MAL_ATTACH_DEFAULT, exec_mode);
 
 		return;
 
@@ -2490,12 +2929,28 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 			}
 
-			run_async_bcast_once_all(buf, total_bytes, 0);
+			run_attach_bcast_once_all(buf, total_bytes, 0, !use_async_attach_mode(exec_mode));
 
 		} else {
 
 			buf = (g.comm.a_rank == 0 && orig) ? orig : std::malloc(total_bytes > 0 ? total_bytes : 1);
-			MPI_Bcast(buf, (int)total_bytes, MPI_BYTE, 0, g.comm.active);
+
+			const bool wait = !use_async_attach_mode(exec_mode);
+			auto task = enqueue_attach_task([buf, total_bytes] {
+
+				if (g.comm.active != MPI_COMM_NULL) {
+
+					MPI_Bcast(buf, (int)total_bytes, MPI_BYTE, 0, g.comm.active);
+
+				}
+
+			});
+
+			if (wait) {
+
+				wait_attach_task(task);
+
+			}
 
 		}
 
@@ -2518,7 +2973,15 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 }
 
-void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, MalAttachPolicy policy) {
+void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+
+	mal_attach_mat(mal_for_nd_base(f), user_ptr, elem_size, primary_n, secondary_n, mode, result_rank, policy, exec_mode);
+
+}
+
+void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+
+	(void)exec_mode;
 
 	if (halo <= 0) {
 
@@ -2574,6 +3037,12 @@ void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, Mal
 		v->halo_initialized = true;
 
 	}
+
+}
+
+void mal_attach_halo(MalForND& f, void** user_ptr, int halo, MalHaloMode mode, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+
+	mal_attach_halo(mal_for_nd_base(f), user_ptr, halo, mode, policy, exec_mode);
 
 }
 
