@@ -41,9 +41,9 @@ static void run_matvec() {
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
 
-	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, MAL_DIM_PARTITIONED, -1);
-	mal_attach_mat(f, (void**)&x, sizeof(double), 1, K, MAL_DIM_SHARED, -1);
-	mal_attach_mat(f, (void**)&y, sizeof(double), M, 1, MAL_DIM_PARTITIONED, 0);
+	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
+	mal_attach_mat(f, (void**)&x, sizeof(double), 1, K, -1, MAL_ATTACH_SHARED_ACTIVE);
+	mal_attach_mat(f, (void**)&y, sizeof(double), M, 1, 0, MAL_ATTACH_PARTITIONED);
 
 	for (; i < lim; i++) {
 
@@ -137,9 +137,9 @@ static void run_matmul() {
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
 
-	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, MAL_DIM_PARTITIONED, -1);
-	mal_attach_mat(f, (void**)&B, sizeof(double), K, N, MAL_DIM_SHARED, -1);
-	mal_attach_mat(f, (void**)&C, sizeof(double), M, N, MAL_DIM_PARTITIONED, 0);
+	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
+	mal_attach_mat(f, (void**)&B, sizeof(double), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
+	mal_attach_mat(f, (void**)&C, sizeof(double), M, N, 0, MAL_ATTACH_PARTITIONED);
 
 	for (; i < lim; i++) {
 

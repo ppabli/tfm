@@ -45,11 +45,6 @@ const char* mal_log_reset_color();
 struct MalVec;
 struct MalAcc;
 
-enum MalDimMode {
-	MAL_DIM_PARTITIONED,
-	MAL_DIM_SHARED,
-};
-
 enum MalHaloMode {
 	MAL_HALO_CLAMP,
 	MAL_HALO_ZERO,
@@ -57,14 +52,20 @@ enum MalHaloMode {
 };
 
 enum MalAttachPolicy {
-	MAL_ATTACH_DEFAULT,
-	MAL_ATTACH_ONCE_ALL,
+	MAL_ATTACH_PARTITIONED,
+	MAL_ATTACH_SHARED_ACTIVE,
+	MAL_ATTACH_SHARED_ALL,
 };
 
 enum MalAttachExecMode {
 	MAL_ATTACH_INHERIT,
 	MAL_ATTACH_SYNC,
 	MAL_ATTACH_ASYNC,
+};
+
+enum MalDataAccessMode {
+	MAL_ACCESS_READ_WRITE,
+	MAL_ACCESS_READ_ONLY,
 };
 
 template<typename T> struct MpiType;
@@ -135,6 +136,7 @@ struct MalForND {
 	std::vector<long*> limit_vars;
 	std::vector<long> starts;
 	std::vector<long> limits;
+	std::vector<long> decoded_idx;
 	long flat{0};
 	long flat_limit{0};
 	bool done{true};
@@ -149,8 +151,8 @@ MalFor& mal_for_nd_base(MalForND& f);
 void mal_check_for(MalFor& f);
 void mal_check_for(MalForND& f);
 
-void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
-void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
+void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
 
 namespace detail {
 
@@ -198,9 +200,9 @@ inline void mal_attach_acc(MalForND& f, T& acc, int result_rank = 0) {
 
 }
 
-void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
-void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
+void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
 
-void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
-void mal_attach_halo(MalForND& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_DEFAULT, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
+void mal_attach_halo(MalForND& f, void** user_ptr, int halo, MalHaloMode mode = MAL_HALO_CLAMP, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT);
 void mal_exchange_halo(MalFor& f);

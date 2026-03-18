@@ -150,6 +150,12 @@ struct MalVec : MalData {
 	bool fully_replicated{false};
 	bool halo_static_once{false};
 	bool halo_initialized{false};
+	MalAttachPolicy attach_policy{MAL_ATTACH_PARTITIONED};
+	MalDataAccessMode access_mode{MAL_ACCESS_READ_WRITE};
+	bool cache_valid{false};
+	long cache_start{0};
+	long cache_end{0};
+	long cache_local_off{0};
 
 	void sync_user_ptr();
 	void free_resources() override;
@@ -925,6 +931,7 @@ MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* lim
 	}
 
 	out.spec = mal_make_collapse_spec(extents.data(), ndims);
+	out.decoded_idx.assign(ndims, 0);
 	out.base = std::make_unique<MalFor>(mal_for_collapse(out.spec, out.flat, out.flat_limit));
 
 	if (out.base) {
@@ -935,16 +942,25 @@ MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* lim
 
 	out.done = (out.flat >= out.flat_limit);
 
+	for (size_t d = 0; d < out.limit_vars.size() && d < out.limits.size(); ++d) {
+
+		if (out.limit_vars[d]) {
+
+			*out.limit_vars[d] = out.limits[d];
+
+		}
+
+	}
+
 	if (!out.done && out.iter_vars.size() == ndims) {
 
-		std::vector<long> idx(ndims, 0);
-		mal_collapse_decode(out.spec, out.flat, idx.data());
+		mal_collapse_decode(out.spec, out.flat, out.decoded_idx.data());
 
 		for (size_t d = 0; d < ndims; ++d) {
 
 			if (out.iter_vars[d]) {
 
-				*out.iter_vars[d] = out.starts[d] + idx[d];
+				*out.iter_vars[d] = out.starts[d] + out.decoded_idx[d];
 
 			}
 
@@ -981,9 +997,64 @@ bool mal_for_nd_done(const MalForND& f) {
 
 }
 
+static void mal_for_nd_sync_limits(MalForND& f) {
+
+	for (size_t d = 0; d < f.limit_vars.size() && d < f.limits.size(); ++d) {
+
+		if (f.limit_vars[d]) {
+
+			*f.limit_vars[d] = f.limits[d];
+
+		}
+
+	}
+
+}
+
+static void mal_for_nd_set_iters_from_flat(MalForND& f, long flat_iter, bool for_post_check) {
+
+	if (f.spec.extents.empty() || flat_iter < 0) {
+
+		return;
+
+	}
+
+	if (f.decoded_idx.size() != f.spec.extents.size()) {
+
+		f.decoded_idx.assign(f.spec.extents.size(), 0);
+
+	}
+
+	mal_collapse_decode(f.spec, flat_iter, f.decoded_idx.data());
+
+	const size_t ndims = f.decoded_idx.size();
+
+	for (size_t d = 0; d < ndims && d < f.iter_vars.size() && d < f.starts.size(); ++d) {
+
+		if (!f.iter_vars[d]) {
+
+			continue;
+
+		}
+
+		long v = f.starts[d] + f.decoded_idx[d];
+
+		if (for_post_check && d + 1 == ndims) {
+
+			v -= 1;
+
+		}
+
+		*f.iter_vars[d] = v;
+
+	}
+
+}
+
 static void mal_for_nd_mark_done(MalForND& f) {
 
 	f.done = true;
+	mal_for_nd_sync_limits(f);
 
 	for (size_t d = 0; d < f.iter_vars.size() && d < f.limits.size(); ++d) {
 
@@ -1002,36 +1073,6 @@ void mal_check_for(MalForND& f) {
 	if (mal_for_nd_done(f)) {
 
 		return;
-
-	}
-
-	long current_flat = f.flat;
-
-	if (!f.iter_vars.empty() && f.iter_vars.size() == f.spec.extents.size()) {
-
-		current_flat = 0;
-
-		for (size_t d = 0; d < f.iter_vars.size(); ++d) {
-
-			if (!f.iter_vars[d]) {
-
-				continue;
-
-			}
-
-			long rel = *f.iter_vars[d] - f.starts[d];
-
-			if (rel < 0 || rel >= f.spec.extents[d]) {
-
-				continue;
-
-			}
-
-			current_flat += rel * f.spec.strides[d];
-
-		}
-
-		f.flat = current_flat;
 
 	}
 
@@ -1058,35 +1099,8 @@ void mal_check_for(MalForND& f) {
 	}
 
 	f.flat = next_flat;
-
-	std::vector<long> idx(f.spec.extents.size(), 0);
-	mal_collapse_decode(f.spec, next_flat, idx.data());
-
-	const size_t ndims = idx.size();
-
-	for (size_t d = 0; d < ndims; ++d) {
-
-		if (!f.iter_vars.empty() && d < f.iter_vars.size() && f.iter_vars[d]) {
-
-			if (d + 1 == ndims) {
-
-				*f.iter_vars[d] = f.starts[d] + idx[d] - 1;
-
-			} else {
-
-				*f.iter_vars[d] = f.starts[d] + idx[d];
-
-			}
-
-		}
-
-		if (!f.limit_vars.empty() && d < f.limit_vars.size() && f.limit_vars[d] && d < f.limits.size()) {
-
-			*f.limit_vars[d] = f.limits[d];
-
-		}
-
-	}
+	mal_for_nd_sync_limits(f);
+	mal_for_nd_set_iters_from_flat(f, next_flat, true);
 
 }
 
@@ -1256,6 +1270,95 @@ static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::
 
 }
 
+static bool vec_can_reuse_assigned_ranges(const MalVec& v, const std::vector<std::pair<long,long>>& assigned) {
+
+	if (v.access_mode != MAL_ACCESS_READ_ONLY || !v.cache_valid) {
+
+		return false;
+
+	}
+
+	if (assigned.empty()) {
+
+		return true;
+
+	}
+
+	for (const auto& rg : assigned) {
+
+		const long s = rg.first;
+		const long e = rg.second;
+
+		if (s < v.cache_start || e > v.cache_end || s > e) {
+
+			return false;
+
+		}
+
+	}
+
+	return true;
+
+}
+
+static bool vec_reuse_local_copy(MalVec& v, const std::vector<std::pair<long,long>>& assigned, long done_n) {
+
+	if (!vec_can_reuse_assigned_ranges(v, assigned)) {
+
+		return false;
+
+	}
+
+	if (assigned.empty()) {
+
+		return true;
+
+	}
+
+	if (done_n < 0) {
+
+		return false;
+
+	}
+
+	long dst_off = done_n;
+
+	for (const auto& rg : assigned) {
+
+		const long s = rg.first;
+		const long e = rg.second;
+		const long len = e - s;
+
+		if (len <= 0) {
+
+			continue;
+
+		}
+
+		const long src_off = v.cache_local_off + (s - v.cache_start);
+
+		if (src_off < 0 || src_off + len > v.local_n) {
+
+			return false;
+
+		}
+
+		if (dst_off != src_off) {
+
+			std::memmove(static_cast<char*>(v.buf) + dst_off * (long)v.elem_size,
+				static_cast<char*>(v.buf) + src_off * (long)v.elem_size,
+				(size_t)len * v.elem_size);
+
+		}
+
+		dst_off += len;
+
+	}
+
+	return true;
+
+}
+
 class Resizer {
 
 	std::vector<std::pair<long,long>> remaining_;
@@ -1278,6 +1381,7 @@ class Resizer {
 	void reduce_accs();
 	void apply_active();
 	void apply_inactive();
+	void broadcast_shared_vecs();
 	void broadcast_shared_mats();
 
 	int target_;
@@ -1409,11 +1513,17 @@ void Resizer::redistribute_vecs() {
 	}
 
 	std::vector<size_t> esizes(n, 0);
+	std::vector<int> vec_shared_active(n, 0);
 
-	for (int vi = 0; vi < nvecs; vi++)
+	for (int vi = 0; vi < nvecs; vi++) {
+
 		esizes[vi] = g.loop->vecs[vi]->elem_size;
+		vec_shared_active[vi] = (g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ACTIVE) ? 1 : 0;
+
+	}
 
 	MPI_Bcast(esizes.data(), n * (int)sizeof(size_t), MPI_BYTE, 0, g.comm.universe);
+	MPI_Bcast(vec_shared_active.data(), n, MPI_INT, 0, g.comm.universe);
 
 	std::vector<long> old_vs(g.comm.u_size + 1, 0);
 	std::inclusive_scan(rem_per_rank_.begin(), rem_per_rank_.end(), old_vs.begin() + 1);
@@ -1487,6 +1597,18 @@ void Resizer::redistribute_vecs() {
 		t.esz = esizes[vi];
 		t.v = (vi < nvecs) ? g.loop->vecs[vi] : nullptr;
 
+		if (vec_shared_active[vi]) {
+
+			if (t.v) {
+
+				t.v->done_n = 0;
+
+			}
+
+			continue;
+
+		}
+
 		if (!t.v) {
 
 			continue;
@@ -1494,6 +1616,7 @@ void Resizer::redistribute_vecs() {
 		}
 
 		long nd = t.v->done_n;
+		long old_done = t.v->done_n;
 
 		if (was_active) {
 
@@ -1508,6 +1631,20 @@ void Resizer::redistribute_vecs() {
 		}
 
 		t.v->done_n = nd;
+
+		if (t.v->access_mode == MAL_ACCESS_READ_ONLY && t.v->cache_valid && nd > old_done) {
+
+			long delta = nd - old_done;
+			t.v->cache_start += delta;
+			t.v->cache_local_off += delta;
+
+			if (t.v->cache_start >= t.v->cache_end || t.v->cache_local_off > t.v->local_n) {
+
+				t.v->cache_valid = false;
+
+			}
+
+		}
 
 	}
 
@@ -1525,17 +1662,29 @@ void Resizer::redistribute_vecs() {
 
 	}
 
-	bool will_receive_data = false;
+	std::vector<std::pair<long,long>> my_assigned;
 
 	if (am_receiver && my_new_count_ > 0) {
 
-		for (const auto& tr : plan) {
+		my_assigned = slice_remaining(remaining_, my_new_vs_, my_new_vs_ + my_new_count_);
 
-			if (tr.new_rank == g.comm.u_rank) {
+	}
 
-				will_receive_data = true;
+	std::vector<int> my_reuse_flags(n, 0);
 
-				break;
+	if (am_receiver && my_new_count_ > 0) {
+
+		for (int vi = 0; vi < n; ++vi) {
+
+			if (vec_shared_active[vi] || !vtasks_[vi].v) {
+
+				continue;
+
+			}
+
+			if (vtasks_[vi].v && vec_can_reuse_assigned_ranges(*vtasks_[vi].v, my_assigned)) {
+
+				my_reuse_flags[vi] = 1;
 
 			}
 
@@ -1543,9 +1692,54 @@ void Resizer::redistribute_vecs() {
 
 	}
 
-	if (will_receive_data) {
+	std::vector<int> all_reuse_flags((size_t)g.comm.u_size * (size_t)n, 0);
+	MPI_Allgather(my_reuse_flags.data(), n, MPI_INT, all_reuse_flags.data(), n, MPI_INT, g.comm.universe);
 
-		for (int vi = 0; vi < n; vi++) {
+	auto receiver_reuses = [&](int rank, int vi) {
+
+		return all_reuse_flags[(size_t)rank * (size_t)n + (size_t)vi] != 0;
+
+	};
+
+	std::vector<int> need_recv_per_vec(n, 0);
+
+	if (am_receiver && my_new_count_ > 0) {
+
+		for (const auto& tr : plan) {
+
+			if (tr.new_rank == g.comm.u_rank) {
+
+				for (int vi = 0; vi < n; ++vi) {
+
+					if (!receiver_reuses(g.comm.u_rank, vi)) {
+
+						need_recv_per_vec[vi] = 1;
+
+					}
+
+				}
+
+			}
+
+		}
+
+	}
+
+	for (int vi = 0; vi < n; ++vi) {
+
+		if (vec_shared_active[vi]) {
+
+			continue;
+
+		}
+
+		if (!need_recv_per_vec[vi]) {
+
+			continue;
+
+		}
+
+		{
 
 			size_t bytes = my_new_count_ * esizes[vi];
 			vtasks_[vi].gathered = static_cast<char*>(pool_alloc(bytes));
@@ -1561,6 +1755,18 @@ void Resizer::redistribute_vecs() {
 	for (const auto& tr : plan) {
 
 		for (int vi = 0; vi < n; vi++) {
+
+			if (vec_shared_active[vi]) {
+
+				continue;
+
+			}
+
+			if (receiver_reuses(tr.new_rank, vi)) {
+
+				continue;
+
+			}
 
 			auto& t = vtasks_[vi];
 			long bytes64 = tr.v_count * (long)t.esz;
@@ -1683,11 +1889,35 @@ void Resizer::apply_active() {
 
 			}
 
+			if (t.v->attach_policy == MAL_ATTACH_SHARED_ACTIVE) {
+
+				t.v->buf = checked_realloc(t.v->buf, std::max(1L, t.v->total_N) * (long)t.esz, "apply_active.shared_active");
+				t.v->local_n = t.v->total_N;
+				t.v->done_n = 0;
+				t.v->buf_global_start = 0;
+				t.v->plan_origin_n = 0;
+				t.v->fully_replicated = true;
+				t.v->cache_valid = false;
+				t.v->sync_user_ptr();
+
+				std::free(t.gathered); t.gathered = nullptr;
+
+				continue;
+
+			}
+
 			long new_local = t.v->done_n + new_asgn;
+			bool reused_local = false;
+
+			if (new_asgn > 0 && !assigned.empty() && !t.gathered) {
+
+				reused_local = vec_reuse_local_copy(*t.v, assigned, t.v->done_n);
+
+			}
 
 			t.v->buf = checked_realloc(t.v->buf, std::max(1L, new_local) * (long)t.esz, "apply_active");
 
-			if (new_asgn > 0 && t.gathered && !assigned.empty()) {
+			if (new_asgn > 0 && !reused_local && t.gathered && !assigned.empty()) {
 
 				long buf_off = t.v->done_n;
 
@@ -1715,6 +1945,36 @@ void Resizer::apply_active() {
 
 			t.v->local_n = new_local;
 			t.v->plan_origin_n = t.v->done_n;
+
+			if (t.v->access_mode == MAL_ACCESS_READ_ONLY && !assigned.empty()) {
+
+				long total_len = 0;
+				for (const auto& rg : assigned) {
+
+					total_len += std::max(0L, rg.second - rg.first);
+
+				}
+
+				const long span = assigned.back().second - assigned.front().first;
+
+				if (total_len == span && span > 0) {
+
+					t.v->cache_valid = true;
+					t.v->cache_start = assigned.front().first;
+					t.v->cache_end = assigned.back().second;
+					t.v->cache_local_off = t.v->done_n;
+
+				} else {
+
+					t.v->cache_valid = false;
+
+				}
+
+			} else if (t.v->access_mode != MAL_ACCESS_READ_ONLY) {
+
+				t.v->cache_valid = false;
+
+			}
 
 			if (!assigned.empty()) {
 
@@ -1805,6 +2065,7 @@ void Resizer::apply_active() {
 
 	}
 
+	broadcast_shared_vecs();
 	broadcast_shared_mats();
 
 	for (auto& vp : g.vecs) {
@@ -1863,6 +2124,105 @@ void Resizer::broadcast_shared_mats() {
 
 }
 
+void Resizer::broadcast_shared_vecs() {
+
+	bool any_new = (target_ > old_a_size_);
+
+	if (!any_new || g.comm.active == MPI_COMM_NULL) {
+
+		return;
+
+	}
+
+	std::vector<int> idxs;
+	std::vector<int> bytes;
+
+	if (g.comm.a_rank == 0) {
+
+		idxs.reserve(g.vecs.size());
+		bytes.reserve(g.vecs.size());
+
+		for (int i = 0; i < (int)g.vecs.size(); ++i) {
+
+			MalVec* v = g.vecs[i].get();
+
+			if (!v || v->attach_policy != MAL_ATTACH_SHARED_ACTIVE) {
+
+				continue;
+
+			}
+
+			idxs.push_back(i);
+
+			size_t b = (size_t)std::max(0L, v->total_N) * v->elem_size;
+
+			if (b > (size_t)INT_MAX) {
+
+				MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector size overflow (%zu bytes)", b);
+				MPI_Abort(g.comm.universe, 1);
+
+			}
+
+			bytes.push_back((int)b);
+
+		}
+
+	}
+
+	int n = (int)idxs.size();
+	MPI_Bcast(&n, 1, MPI_INT, 0, g.comm.active);
+
+	idxs.resize(n);
+	bytes.resize(n);
+
+	if (n == 0) {
+
+		return;
+
+	}
+
+	MPI_Bcast(idxs.data(), n, MPI_INT, 0, g.comm.active);
+	MPI_Bcast(bytes.data(), n, MPI_INT, 0, g.comm.active);
+
+	for (int k = 0; k < n; ++k) {
+
+		int vi = idxs[k];
+		int nbytes = bytes[k];
+
+		if (vi < 0 || vi >= (int)g.vecs.size()) {
+
+			MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector index out of range: %d", vi);
+			MPI_Abort(g.comm.universe, 1);
+
+		}
+
+		MalVec* v = g.vecs[vi].get();
+
+		if (!v) {
+
+			MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector missing at index %d", vi);
+			MPI_Abort(g.comm.universe, 1);
+
+		}
+
+		v->buf = checked_realloc(v->buf, std::max(1L, v->total_N) * (long)v->elem_size, "broadcast_shared_vecs");
+		v->local_n = v->total_N;
+		v->done_n = 0;
+		v->buf_global_start = 0;
+		v->fully_replicated = true;
+
+		if (nbytes > 0) {
+
+			MPI_Bcast(v->buf, nbytes, MPI_BYTE, 0, g.comm.active);
+
+		}
+
+		v->sync_user_ptr();
+
+	}
+
+}
+
 void Resizer::apply_inactive() {
 
 	g.comm.a_rank = -1;
@@ -1878,8 +2238,41 @@ void Resizer::apply_inactive() {
 
 		}
 
-		t.v->buf = checked_realloc(t.v->buf, std::max(1L, t.v->done_n) * (long)t.esz, "apply_inactive");
-		t.v->local_n = t.v->done_n;
+		if (t.v->attach_policy == MAL_ATTACH_SHARED_ACTIVE) {
+
+			t.v->cache_valid = false;
+			t.v->fully_replicated = true;
+			t.v->buf_global_start = 0;
+			t.v->local_n = t.v->total_N;
+			t.v->done_n = 0;
+			t.v->sync_user_ptr();
+
+			continue;
+
+		}
+
+		if (t.v->access_mode == MAL_ACCESS_READ_ONLY) {
+
+			if (t.v->cache_valid) {
+
+				t.v->cache_local_off = std::max(t.v->cache_local_off, t.v->done_n);
+
+			} else if (t.v->local_n > t.v->done_n && t.v->buf_global_start + t.v->done_n <= t.v->buf_global_start + t.v->local_n) {
+
+				t.v->cache_valid = true;
+				t.v->cache_start = t.v->buf_global_start + t.v->done_n;
+				t.v->cache_end = t.v->buf_global_start + t.v->local_n;
+				t.v->cache_local_off = t.v->done_n;
+
+			}
+
+		} else {
+
+			t.v->cache_valid = false;
+			t.v->buf = checked_realloc(t.v->buf, std::max(1L, t.v->done_n) * (long)t.esz, "apply_inactive");
+			t.v->local_n = t.v->done_n;
+
+		}
 
 		t.v->sync_user_ptr();
 
@@ -2665,7 +3058,7 @@ void mal_check_for(MalFor& f) {
 
 }
 
-void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
 
 	auto vp = std::make_unique<MalVec>();
 	MalVec* v = vp.get();
@@ -2680,6 +3073,9 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 	v->user_ptr = user_ptr;
 	v->gather_root = result_rank;
 	v->fully_replicated = false;
+	v->attach_policy = policy;
+	v->access_mode = access_mode;
+	v->cache_valid = false;
 
 	if (result_rank >= 0 && g.comm.u_rank == result_rank) {
 
@@ -2687,7 +3083,8 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	}
 
-	bool once_all = (policy == MAL_ATTACH_ONCE_ALL);
+	const bool shared_active = (policy == MAL_ATTACH_SHARED_ACTIVE);
+	bool once_all = (policy == MAL_ATTACH_SHARED_ALL);
 
 	if (elem_size == 0) {
 
@@ -2701,14 +3098,15 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	}
 
-	if (once_all && result_rank >= 0) {
+	if ((once_all || shared_active) && result_rank >= 0) {
 
-		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_ONCE_ALL ignored for gather vector (result_rank=%d)", result_rank);
+		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Shared vector policy ignores gather result_rank=%d", result_rank);
 		once_all = false;
+		result_rank = -1;
 
 	}
 
-	if (once_all) {
+	if (once_all || shared_active) {
 
 		n = total_N;
 		v->local_n = n;
@@ -2749,7 +3147,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 		if (g.comm.u_rank == 0 && total_bytes > 0 && !orig) {
 
-			MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_ONCE_ALL vector has null root pointer; broadcasting zero-initialized data");
+			MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_SHARED_ALL vector has null root pointer; broadcasting zero-initialized data");
 
 		}
 
@@ -2768,6 +3166,53 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 		run_attach_bcast_once_all(v->buf, total_bytes, 0, !use_async_attach_mode(exec_mode));
 
 		if (g.comm.u_rank == 0 && orig && result_rank < 0) {
+
+			std::free(orig);
+
+		}
+
+	} else if (!g.pending && shared_active && g.comm.active != MPI_COMM_NULL) {
+
+		size_t total_bytes = (size_t)std::max(0L, total_N) * elem_size;
+
+		if (g.comm.a_rank == 0 && total_bytes > 0 && !orig) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_SHARED_ACTIVE vector has null active-root pointer; broadcasting zero-initialized data");
+
+		}
+
+		if (g.comm.a_rank == 0 && total_bytes > 0) {
+
+			std::memset(v->buf, 0, total_bytes);
+
+			if (orig) {
+
+				std::memcpy(v->buf, orig, total_bytes);
+
+			}
+
+		}
+
+		const bool wait = !use_async_attach_mode(exec_mode);
+		auto task = enqueue_attach_task([v, total_bytes] {
+
+			if (g.comm.active == MPI_COMM_NULL || total_bytes == 0) {
+
+				return;
+
+			}
+
+			MPI_Bcast(v->buf, (int)total_bytes, MPI_BYTE, 0, g.comm.active);
+
+		});
+
+		if (wait) {
+
+			wait_attach_task(task);
+
+		}
+
+		if (g.comm.a_rank == 0 && orig) {
 
 			std::free(orig);
 
@@ -2819,9 +3264,9 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 }
 
-void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
 
-	mal_attach_vec(mal_for_nd_base(f), user_ptr, elem_size, total_N, result_rank, policy, exec_mode);
+	mal_attach_vec(mal_for_nd_base(f), user_ptr, elem_size, total_N, result_rank, policy, exec_mode, access_mode);
 
 }
 
@@ -2857,7 +3302,7 @@ void detail::acc_register(MalFor& f, detail::AccDesc d, int result_rank) {
 
 }
 
-void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
 
 	if (elem_size == 0 || primary_n < 0 || secondary_n < 0) {
 
@@ -2865,33 +3310,25 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	}
 
-	if (policy == MAL_ATTACH_ONCE_ALL && mode == MAL_DIM_PARTITIONED && result_rank < 0) {
+	if (policy == MAL_ATTACH_PARTITIONED) {
 
-		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, -1, MAL_ATTACH_ONCE_ALL, exec_mode);
-
-		return;
-
-	}
-
-	if (policy == MAL_ATTACH_ONCE_ALL && mode == MAL_DIM_PARTITIONED && result_rank >= 0) {
-
-		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_ONCE_ALL ignored for partitioned matrix with result_rank=%d", result_rank);
-
-	}
-
-	if (mode == MAL_DIM_PARTITIONED) {
-
-		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, result_rank, MAL_ATTACH_DEFAULT, exec_mode);
+		mal_attach_vec(f, user_ptr, elem_size * (size_t)secondary_n, primary_n, result_rank, MAL_ATTACH_PARTITIONED, exec_mode, access_mode);
 
 		return;
 
 	}
 
-	bool once_all = (policy == MAL_ATTACH_ONCE_ALL);
+	const bool shared_all = (policy == MAL_ATTACH_SHARED_ALL);
 
-	if (!once_all && g.comm.active == MPI_COMM_NULL) {
+	if (!shared_all && g.comm.active == MPI_COMM_NULL) {
 
 		return;
+
+	}
+
+	if (result_rank >= 0) {
+
+		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "result_rank=%d ignored for shared matrix policies", result_rank);
 
 	}
 
@@ -2899,7 +3336,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 	void* orig = user_ptr ? *user_ptr : nullptr;
 	void* buf;
 
-	if (g.pending && g.pending->shared_idx < g.pending->shared_mats.size() && !once_all) {
+	if (g.pending && g.pending->shared_idx < g.pending->shared_mats.size() && !shared_all) {
 
 		buf = g.pending->shared_mats[g.pending->shared_idx];
 		g.pending->shared_mats[g.pending->shared_idx] = nullptr;
@@ -2907,7 +3344,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	} else {
 
-		if (once_all) {
+		if (shared_all) {
 
 			buf = std::malloc(total_bytes > 0 ? total_bytes : 1);
 
@@ -2925,7 +3362,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 			if (g.comm.u_rank == 0 && total_bytes > 0 && !orig) {
 
-				MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_ONCE_ALL matrix has null root pointer; broadcasting zero-initialized data");
+				MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "MAL_ATTACH_SHARED_ALL matrix has null root pointer; broadcasting zero-initialized data");
 
 			}
 
@@ -2966,16 +3403,16 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	sp->buf = buf;
 	sp->total_bytes = total_bytes;
-	sp->user_owned = once_all ? (g.comm.u_rank == 0 && orig != nullptr) : (g.comm.a_rank == 0 && orig != nullptr);
+	sp->user_owned = shared_all ? (g.comm.u_rank == 0 && orig != nullptr) : (g.comm.a_rank == 0 && orig != nullptr);
 	sp->user_ptr = user_ptr;
 
 	g.shared.push_back(std::move(sp));
 
 }
 
-void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, MalDimMode mode, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode) {
+void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
 
-	mal_attach_mat(mal_for_nd_base(f), user_ptr, elem_size, primary_n, secondary_n, mode, result_rank, policy, exec_mode);
+	mal_attach_mat(mal_for_nd_base(f), user_ptr, elem_size, primary_n, secondary_n, result_rank, policy, exec_mode, access_mode);
 
 }
 
@@ -3014,7 +3451,7 @@ void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, Mal
 
 	v->halo_n = halo;
 	v->halo_mode = mode;
-	v->halo_static_once = (policy == MAL_ATTACH_ONCE_ALL);
+	v->halo_static_once = (policy == MAL_ATTACH_SHARED_ALL);
 	v->halo_initialized = false;
 
 	if (v->fully_replicated && v->halo_static_once) {
