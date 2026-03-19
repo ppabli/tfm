@@ -16,10 +16,13 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <bit>
 
 static constexpr int kDefaultSeq[] = {2, 4, 4, 3, 1, 4};
 
 class BufferPool {
+
+	static constexpr int kTLCacheSlots = 8;
 
 	struct Entry {
 		void* ptr;
@@ -29,16 +32,64 @@ class BufferPool {
 	std::unordered_map<size_t, std::vector<Entry>> buckets_;
 	std::mutex mtx_;
 
-	static size_t bucket_key(size_t bytes) {
+	struct TLSlot {
+		void* ptr{nullptr};
+		size_t cap{0};
+	};
 
-		if (bytes == 0) {
+	struct TLBucket {
+		TLSlot slots[kTLCacheSlots]{};
+		int count{0};
+	};
 
-			return 0;
+	using TLMap = std::unordered_map<size_t, TLBucket>;
+
+	struct TLGuard {
+
+		TLMap map;
+
+		~TLGuard() {
+
+			for (auto& [key, tb] : map) {
+
+				for (int i = 0; i < tb.count; ++i) {
+
+					if (tb.slots[i].ptr) {
+
+						std::free(tb.slots[i].ptr);
+
+					}
+
+				}
+
+			}
 
 		}
 
-		size_t key = 1UL << (64 - __builtin_clzl(bytes - 1));
-		return key;
+	};
+
+	static TLMap& tl_map() noexcept {
+
+		static thread_local TLGuard g;
+		return g.map;
+
+	}
+
+	static unsigned clz64(unsigned long long v) noexcept {
+
+		return (unsigned)std::countl_zero(v);
+
+	}
+
+	static size_t bucket_key(size_t bytes) noexcept {
+
+		if (bytes <= 1) {
+
+			return 1;
+
+		}
+
+		return size_t{1} << (64 - clz64((unsigned long long)(bytes - 1)));
 
 	}
 
@@ -62,18 +113,26 @@ public:
 
 	void* acquire(size_t min_bytes) {
 
-		if (min_bytes == 0) {
+		size_t key = bucket_key(min_bytes > 0 ? min_bytes : 1);
 
-			min_bytes = 1;
+		TLMap& tlm = tl_map();
+		auto tlit = tlm.find(key);
+
+		if (MAL_LIKELY(tlit != tlm.end())) {
+
+			TLBucket& tb = tlit->second;
+
+			if (tb.count > 0) {
+
+				return tb.slots[--tb.count].ptr;
+
+			}
 
 		}
-
-		size_t key = bucket_key(min_bytes);
 
 		{
 
 			std::lock_guard lk(mtx_);
-
 			auto it = buckets_.find(key);
 
 			if (it != buckets_.end() && !it->second.empty()) {
@@ -89,7 +148,7 @@ public:
 
 		void* p = std::malloc(key);
 
-		if (!p) {
+		if (MAL_UNLIKELY(!p)) {
 
 			throw std::bad_alloc();
 
@@ -108,6 +167,14 @@ public:
 		}
 
 		size_t key = bucket_key(capacity > 0 ? capacity : 1);
+		TLBucket& tb = tl_map()[key];
+
+		if (MAL_LIKELY(tb.count < kTLCacheSlots)) {
+
+			tb.slots[tb.count++] = {ptr, capacity};
+			return;
+
+		}
 
 		std::lock_guard lk(mtx_);
 		buckets_[key].push_back({ptr, capacity});
@@ -118,6 +185,7 @@ public:
 
 static BufferPool g_buffer_pool;
 
+
 struct MalData {
 
 	virtual ~MalData() = default;
@@ -125,19 +193,20 @@ struct MalData {
 
 };
 
-struct MalVec : MalData {
+struct alignas(64) MalVec : MalData {
 
 	void* buf{nullptr};
-	size_t buf_bytes{0};
-	size_t elem_size{0};
+	void** user_ptr{nullptr};
+	long buf_global_start{0};
 	long local_n{0};
 	long done_n{0};
-	long buf_global_start{0};
+	size_t elem_size{0};
+	size_t buf_bytes{0};
 	long total_N{0};
-	void** user_ptr{nullptr};
+
+	long plan_origin_n{0};
 	int gather_root{-1};
 	void* result_buf{nullptr};
-	long plan_origin_n{0};
 
 	std::vector<std::pair<long,long>> done_segs;
 
@@ -148,17 +217,39 @@ struct MalVec : MalData {
 	int halo_lnbr{MPI_PROC_NULL};
 	int halo_rnbr{MPI_PROC_NULL};
 	MPI_Comm cart_comm{MPI_COMM_NULL};
+
 	bool fully_replicated{false};
 	bool halo_static_once{false};
 	bool halo_initialized{false};
 	MalAttachPolicy attach_policy{MAL_ATTACH_PARTITIONED};
 	MalDataAccessMode access_mode{MAL_ACCESS_READ_WRITE};
+
 	bool cache_valid{false};
 	long cache_start{0};
 	long cache_end{0};
 	long cache_local_off{0};
 
-	void sync_user_ptr();
+	MAL_ALWAYS_INLINE void sync_user_ptr() noexcept {
+
+		if (MAL_UNLIKELY(!user_ptr)) {
+
+			return;
+
+		}
+
+		if (halo_n > 0 && halo_buf) {
+
+			long active_start = buf_global_start + done_n;
+			*user_ptr = static_cast<char*>(halo_buf) + (long)halo_n * (long)elem_size - active_start * (long)elem_size;
+
+		} else {
+
+			*user_ptr = static_cast<char*>(buf) - buf_global_start * (long)elem_size;
+
+		}
+
+	}
+
 	void free_resources() override;
 
 };
@@ -230,7 +321,7 @@ struct MalState {
 
 	struct GatherCacheEntry {
 
-		char* ptr{nullptr};
+		void* ptr{nullptr};
 		size_t capacity{0};
 
 	};
@@ -273,21 +364,24 @@ struct MalState {
 
 		std::mutex mu;
 		std::condition_variable cv;
-		std::atomic<bool> compute_ready{false};
-		std::atomic<bool> resize_pending{false};
-		std::atomic<bool> attach_pending{false};
-		std::atomic<bool> stop{false};
+
+		alignas(64) std::atomic<bool> compute_ready{false};
+		alignas(64) std::atomic<bool> resize_pending{false};
+		alignas(64) std::atomic<bool> attach_pending{false};
+		alignas(64) std::atomic<bool> stop{false};
 
 		template<typename Pred>
 		void compute_wait(Pred ready) {
 
 			compute_ready = true;
 
-			cv.notify_all();
+			cv.notify_one();
 
 			{
+
 				std::unique_lock lk(mu);
 				cv.wait(lk, ready);
+
 			}
 
 			compute_ready = false;
@@ -389,23 +483,29 @@ static const MPI_Datatype kDtypeTbl[] = {MPI_INT, MPI_LONG, MPI_LONG_LONG, MPI_U
 
 static const MPI_Op kDopTbl[] = {MPI_SUM, MPI_PROD, MPI_MAX, MPI_MIN};
 
-static MPI_Datatype tag_dtype(int t) {
+static MPI_Datatype tag_dtype(int t) noexcept {
 
 	return (t >= 0 && t < (int)std::size(kDtypeTbl)) ? kDtypeTbl[t] : MPI_LONG;
 
 }
-static int dtype_tag(MPI_Datatype d) {
+
+static int dtype_tag(MPI_Datatype d) noexcept {
 
 	for (int i = 0; i < (int)std::size(kDtypeTbl); ++i) {
 
-		if (kDtypeTbl[i] == d) return i;
+		if (kDtypeTbl[i] == d) {
+
+			return i;
+
+		}
 
 	}
 
 	return 1;
 
 }
-static int dop_tag(MPI_Op d) {
+
+static int dop_tag(MPI_Op d) noexcept {
 
 	for (int i = 0; i < (int)std::size(kDopTbl); ++i) {
 
@@ -420,7 +520,8 @@ static int dop_tag(MPI_Op d) {
 	return 0;
 
 }
-static MPI_Op tag_dop(int t) {
+
+static MPI_Op tag_dop(int t) noexcept {
 
 	return (t >= 0 && t < (int)std::size(kDopTbl)) ? kDopTbl[t] : MPI_SUM;
 
@@ -433,12 +534,17 @@ static void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
 	switch (dop_tag) {
 
 		case 0: break;
+
 		case 1:
+
 			switch (dtype_tag) {
+
 				case 5: v.f = 1.0f; break;
 				case 6: v.d = 1.0; break;
 				default: v.l = 1; break;
+
 			} break;
+
 		case 2:
 
 			switch (dtype_tag) {
@@ -477,7 +583,7 @@ static void* checked_realloc(void* p, size_t n, const char* ctx) {
 
 	void* nb = std::realloc(p, n);
 
-	if (!nb) {
+	if (MAL_UNLIKELY(!nb)) {
 
 		MAL_LOG_L(MAL_LOG_ERROR, "ALLOC", "realloc failed in %s", ctx);
 		MPI_Abort(g.comm.universe, 1);
@@ -488,11 +594,11 @@ static void* checked_realloc(void* p, size_t n, const char* ctx) {
 
 }
 
-static void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes) {
+static void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes, bool preserve_data = true) {
 
-	size_t need = std::max((size_t)1, min_bytes);
+	size_t need = std::max(size_t{1}, min_bytes);
 
-	if (ptr && capacity >= need) {
+	if (MAL_LIKELY(ptr && capacity >= need)) {
 
 		return;
 
@@ -502,11 +608,15 @@ static void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes) {
 
 	if (ptr) {
 
-		size_t copy_bytes = std::min(capacity, need);
+		if (preserve_data) {
 
-		if (copy_bytes > 0) {
+			size_t copy_bytes = std::min(capacity, need);
 
-			std::memcpy(nb, ptr, copy_bytes);
+			if (copy_bytes > 0) {
+
+				std::memcpy(nb, ptr, copy_bytes);
+
+			}
 
 		}
 
@@ -554,9 +664,11 @@ static std::shared_ptr<MalState::AsyncBcastTask> enqueue_attach_task(std::functi
 	task->run = std::move(fn);
 
 	{
+
 		std::lock_guard lk(g.attach_mu);
 		g.attach_tasks.push_back(task);
 		g.sync.attach_pending = true;
+
 	}
 
 	g.sync.notify();
@@ -581,9 +693,10 @@ static void wait_attach_task(const std::shared_ptr<MalState::AsyncBcastTask>& ta
 void mal_wait_attach_tasks() {
 
 	std::unique_lock lk(g.sync.mu);
+
 	g.sync.cv.wait(lk, [] {
 
-		return (!g.sync.attach_pending.load() && g.attach_inflight.load() == 0) || g.sync.stop.load();
+		return (!g.sync.attach_pending.load() && g.attach_inflight.load(std::memory_order_acquire) == 0) || g.sync.stop.load();
 
 	});
 
@@ -646,11 +759,9 @@ static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 
 	MPI_Bcast(meta.data(), n * (int)sizeof(Meta), MPI_BYTE, 0, g.comm.universe);
 
-	int ai = 0;
+	static thread_local std::vector<char> tl_send, tl_recv;
 
-	std::vector<char> send, recv;
-	send.reserve(512);
-	recv.reserve(512);
+	int ai = 0;
 
 	while (ai < n) {
 
@@ -664,14 +775,14 @@ static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 		}
 
 		int gsz = ae - ai;
+		size_t total = (size_t)gsz * (size_t)esz;
 
-		send.resize(gsz * esz);
-		recv.resize(gsz * esz);
+		tl_send.resize(total);
+		tl_recv.resize(total);
 
 		for (int k = ai; k < ae; k++) {
 
-			char* slot = send.data() + (k - ai) * esz;
-
+			char* slot = tl_send.data() + (k - ai) * esz;
 			MalAcc* a = get_acc(k);
 
 			if (a) {
@@ -692,11 +803,11 @@ static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 
 		}
 
-		MPI_Allreduce(send.data(), recv.data(), gsz, tag_dtype(meta[ai].dt), tag_dop(meta[ai].dp), g.comm.universe);
+		MPI_Allreduce(tl_send.data(), tl_recv.data(), gsz, tag_dtype(meta[ai].dt), tag_dop(meta[ai].dp), g.comm.universe);
 
 		for (int k = ai; k < ae; k++) {
 
-			on_result(k, recv.data() + (k - ai) * esz, esz);
+			on_result(k, tl_recv.data() + (k - ai) * esz, esz);
 
 		}
 
@@ -739,8 +850,10 @@ static void sync_vec_mapping_for_current_range(MalFor& f) {
 		long new_global_start = f.start - (v->done_n + f.range_local_base);
 
 		if (v->buf_global_start != new_global_start) {
+
 			v->buf_global_start = new_global_start;
 			v->sync_user_ptr();
+
 		}
 
 	}
@@ -749,13 +862,13 @@ static void sync_vec_mapping_for_current_range(MalFor& f) {
 
 static void append_done_segments(MalVec& v, const MalFor& f, long local_origin, long from_local, long to_local) {
 
-	if (to_local <= from_local || from_local >= to_local) {
+	if (MAL_UNLIKELY(to_local <= from_local)) {
 
 		return;
 
 	}
 
-	if (f.plan_ranges.size() == 1 && f.plan_local_bases.size() >= 1) {
+	if (MAL_LIKELY(f.plan_ranges.size() == 1 && !f.plan_local_bases.empty())) {
 
 		const auto [gs, ge] = f.plan_ranges[0];
 		const long base = local_origin + f.plan_local_bases[0];
@@ -772,7 +885,7 @@ static void append_done_segments(MalVec& v, const MalFor& f, long local_origin, 
 
 	}
 
-	v.done_segs.reserve(f.plan_ranges.size());
+	v.done_segs.reserve(v.done_segs.size() + f.plan_ranges.size());
 
 	for (size_t ri = 0; ri < f.plan_ranges.size(); ++ri) {
 
@@ -801,9 +914,11 @@ static void append_done_segments(MalVec& v, const MalFor& f, long local_origin, 
 static void freeze_loop_at_current(MalFor& f) {
 
 	long cur = *f.user_iter;
+
 	f.start = cur;
 	set_limit(f, cur);
 	set_iter(f, cur);
+
 	f.extra_ranges.clear();
 	f.extra_range_local_bases.clear();
 	f.extra_idx = 0;
@@ -813,7 +928,7 @@ static void freeze_loop_at_current(MalFor& f) {
 
 }
 
-static void distribute(long total, int nprocs, int rank, long& start, long& end) {
+static void distribute(long total, int nprocs, int rank, long& start, long& end) noexcept {
 
 	long base = total / nprocs;
 	long rem = total % nprocs;
@@ -826,6 +941,7 @@ static std::vector<int> make_displs(const std::vector<int>& counts) {
 
 	std::vector<int> d(counts.size());
 	std::exclusive_scan(counts.begin(), counts.end(), d.begin(), 0);
+
 	return d;
 
 }
@@ -1011,6 +1127,7 @@ MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* lim
 MalForND mal_for_nd_begin(long* const* iter_vars, long* const* limit_vars, const long* starts, const long* limits, size_t ndims) {
 
 	MalForND out = mal_for_nd_begin(iter_vars, starts, limits, ndims);
+
 	out.limit_vars.assign(limit_vars, limit_vars + ndims);
 
 	for (size_t d = 0; d < ndims && d < out.limit_vars.size(); ++d) {
@@ -1090,6 +1207,7 @@ static void mal_for_nd_set_iters_from_flat(MalForND& f, long flat_iter, bool for
 static void mal_for_nd_mark_done(MalForND& f) {
 
 	f.done = true;
+
 	mal_for_nd_sync_limits(f);
 
 	for (size_t d = 0; d < f.iter_vars.size() && d < f.limits.size(); ++d) {
@@ -1143,27 +1261,6 @@ void mal_check_for(MalForND& f) {
 MalFor& mal_for_nd_base(MalForND& f) {
 
 	return *f.base;
-
-}
-
-void MalVec::sync_user_ptr() {
-
-	if (!user_ptr) {
-
-		return;
-
-	}
-
-	if (halo_n > 0 && halo_buf) {
-
-		long active_start = buf_global_start + (long)done_n;
-		*user_ptr = static_cast<char*>(halo_buf) + (long)halo_n * (long)elem_size - active_start * (long)elem_size;
-
-	} else {
-
-		*user_ptr = static_cast<char*>(buf) - buf_global_start * (long)elem_size;
-
-	}
 
 }
 
@@ -1240,14 +1337,13 @@ static void compute_halo_neighbors(MalVec& v) {
 		if (cached_dims[0] == g.comm.a_size && cached_periods[0] == periods[0]) {
 
 			MPI_Cart_shift(v.cart_comm, 0, 1, &v.halo_lnbr, &v.halo_rnbr);
+
 			return;
 
-		} else {
-
-			MPI_Comm_free(&v.cart_comm);
-			v.cart_comm = MPI_COMM_NULL;
-
 		}
+
+		MPI_Comm_free(&v.cart_comm);
+		v.cart_comm = MPI_COMM_NULL;
 
 	}
 
@@ -1265,7 +1361,8 @@ static void compute_halo_neighbors(MalVec& v) {
 
 }
 
-static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::pair<long,long>>& remaining, long vstart, long vend) {
+static std::vector<std::pair<long,long>>
+slice_remaining(const std::vector<std::pair<long,long>>& remaining, long vstart, long vend) {
 
 	std::vector<std::pair<long,long>> out;
 	out.reserve(remaining.size());
@@ -1276,7 +1373,7 @@ static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::
 
 		long len = b - a;
 
-		if (offset + len <= vstart) {
+		if (MAL_UNLIKELY(offset + len <= vstart)) {
 
 			offset += len;
 
@@ -1284,7 +1381,7 @@ static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::
 
 		}
 
-		if (offset >= vend) {
+		if (MAL_UNLIKELY(offset >= vend)) {
 
 			break;
 
@@ -1382,9 +1479,7 @@ static bool vec_reuse_local_copy(MalVec& v, const std::vector<std::pair<long,lon
 
 		if (dst_off != src_off) {
 
-			std::memmove(static_cast<char*>(v.buf) + dst_off * (long)v.elem_size,
-				static_cast<char*>(v.buf) + src_off * (long)v.elem_size,
-				(size_t)len * v.elem_size);
+			std::memmove(static_cast<char*>(v.buf) + dst_off * (long)v.elem_size, static_cast<char*>(v.buf) + src_off * (long)v.elem_size, (size_t)len * v.elem_size);
 
 		}
 
@@ -1404,13 +1499,18 @@ class Resizer {
 	struct VecTask {
 		MalVec* v{nullptr};
 		size_t esz{0};
-		char* gathered{nullptr};
+		void* gathered{nullptr};
 		size_t gathered_bytes{0};
 	};
 
-	std::vector<VecTask> vtasks_;
-	std::vector<long> rem_per_rank_;
+	struct VecMeta {
+		size_t esz{0};
+		int shared_active{0};
+	};
 
+	std::vector<VecTask> vtasks_;
+	std::vector<VecMeta> vmeta_;
+	std::vector<long> rem_per_rank_;
 	std::vector<std::vector<char>> new_epoch_bufs_;
 
 	void collect_ranges();
@@ -1426,7 +1526,6 @@ class Resizer {
 	int old_a_size_{0};
 	long my_new_vs_{0};
 	long my_new_count_{0};
-
 
 public:
 
@@ -1479,19 +1578,6 @@ void Resizer::collect_ranges() {
 	}
 
 	int my_count = (int)local.size();
-	int max_count = 0;
-
-	MPI_Allreduce(&my_count, &max_count, 1, MPI_INT, MPI_MAX, g.comm.universe);
-
-	if (max_count == 0) {
-
-		remaining_.clear();
-		total_rem_ = 0;
-		rem_per_rank_.assign(g.comm.u_size, 0);
-		g.sync.stop = true;
-		return;
-
-	}
 
 	std::vector<int> flat_counts(g.comm.u_size);
 
@@ -1500,9 +1586,20 @@ void Resizer::collect_ranges() {
 	std::vector<int> flat_displs = make_displs(flat_counts);
 
 	int total = flat_displs.back() + flat_counts.back();
+
+	if (total == 0) {
+
+		remaining_.clear();
+		total_rem_ = 0;
+		rem_per_rank_.assign(g.comm.u_size, 0);
+		g.sync.stop = true;
+
+		return;
+
+	}
 	std::vector<long> flat(total > 0 ? total : 1);
 
-	MPI_Allgatherv(local.empty() ? nullptr : local.data(), my_count, MPI_LONG, flat.empty() ? nullptr : flat.data(), flat_counts.data(), flat_displs.data(), MPI_LONG, g.comm.universe);
+	MPI_Allgatherv(local.empty() ? nullptr : local.data(), my_count, MPI_LONG, flat.data(), flat_counts.data(), flat_displs.data(), MPI_LONG, g.comm.universe);
 
 	remaining_.clear();
 	remaining_.reserve(total / 2 + 1);
@@ -1517,11 +1614,11 @@ void Resizer::collect_ranges() {
 
 		for (int p = 0; p < nranges; p++) {
 
-			long s = flat[disp + p * 2], e = flat[disp + p * 2 + 1];
+			long s = flat[disp + p * 2];
+			long e = flat[disp + p * 2 + 1];
 			long len = e - s;
 
 			remaining_.push_back({s, e});
-
 			rem_per_rank_[k] += len;
 			total_rem_ += len;
 
@@ -1550,18 +1647,16 @@ void Resizer::redistribute_vecs() {
 
 	}
 
-	std::vector<size_t> esizes(n, 0);
-	std::vector<int> vec_shared_active(n, 0);
+	vmeta_.resize(n);
 
 	for (int vi = 0; vi < nvecs; vi++) {
 
-		esizes[vi] = g.loop->vecs[vi]->elem_size;
-		vec_shared_active[vi] = (g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ACTIVE) ? 1 : 0;
+		vmeta_[vi].esz = g.loop->vecs[vi]->elem_size;
+		vmeta_[vi].shared_active = (g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ACTIVE) ? 1 : 0;
 
 	}
 
-	MPI_Bcast(esizes.data(), n * (int)sizeof(size_t), MPI_BYTE, 0, g.comm.universe);
-	MPI_Bcast(vec_shared_active.data(), n, MPI_INT, 0, g.comm.universe);
+	MPI_Bcast(vmeta_.data(), n * (int)sizeof(VecMeta), MPI_BYTE, 0, g.comm.universe);
 
 	std::vector<long> old_vs(g.comm.u_size + 1, 0);
 	std::inclusive_scan(rem_per_rank_.begin(), rem_per_rank_.end(), old_vs.begin() + 1);
@@ -1569,11 +1664,9 @@ void Resizer::redistribute_vecs() {
 	struct Transfer { int old_rank, new_rank; long v_start, v_count; };
 
 	std::vector<Transfer> plan;
-
-	plan.reserve(g.comm.u_size + target_);
+	plan.reserve((size_t)g.comm.u_size + (size_t)target_);
 
 	int oi = 0, ni = 0;
-
 	long nv_s{0}, nv_e{0};
 
 	if (target_ > 0) {
@@ -1638,13 +1731,13 @@ void Resizer::redistribute_vecs() {
 
 		auto& t = vtasks_[vi];
 
-		t.esz = esizes[vi];
+		t.esz = vmeta_[vi].esz;
 		t.v = (vi < nvecs) ? g.loop->vecs[vi] : nullptr;
 		t.gathered = g.gather_cache[(size_t)vi].ptr;
 		t.gathered_bytes = g.gather_cache[(size_t)vi].capacity;
 		g.gather_cache[(size_t)vi] = {};
 
-		if (vec_shared_active[vi]) {
+		if (vmeta_[vi].shared_active) {
 
 			if (t.v) {
 
@@ -1702,9 +1795,7 @@ void Resizer::redistribute_vecs() {
 	if (am_receiver) {
 
 		long my_nv_e;
-
 		distribute(total_rem_, target_, g.comm.u_rank, my_new_vs_, my_nv_e);
-
 		my_new_count_ = my_nv_e - my_new_vs_;
 
 	}
@@ -1723,13 +1814,13 @@ void Resizer::redistribute_vecs() {
 
 		for (int vi = 0; vi < n; ++vi) {
 
-			if (vec_shared_active[vi] || !vtasks_[vi].v) {
+			if (vmeta_[vi].shared_active || !vtasks_[vi].v) {
 
 				continue;
 
 			}
 
-			if (vtasks_[vi].v && vec_can_reuse_assigned_ranges(*vtasks_[vi].v, my_assigned)) {
+			if (vec_can_reuse_assigned_ranges(*vtasks_[vi].v, my_assigned)) {
 
 				my_reuse_flags[vi] = 1;
 
@@ -1740,6 +1831,7 @@ void Resizer::redistribute_vecs() {
 	}
 
 	std::vector<int> all_reuse_flags((size_t)g.comm.u_size * (size_t)n, 0);
+
 	MPI_Allgather(my_reuse_flags.data(), n, MPI_INT, all_reuse_flags.data(), n, MPI_INT, g.comm.universe);
 
 	auto receiver_reuses = [&](int rank, int vi) {
@@ -1774,28 +1866,19 @@ void Resizer::redistribute_vecs() {
 
 	for (int vi = 0; vi < n; ++vi) {
 
-		if (vec_shared_active[vi]) {
+		if (vmeta_[vi].shared_active || !need_recv_per_vec[vi]) {
 
 			continue;
 
 		}
 
-		if (!need_recv_per_vec[vi]) {
+		size_t bytes = (size_t)my_new_count_ * vmeta_[vi].esz;
+		void* gp = vtasks_[vi].gathered;
+		size_t gc = vtasks_[vi].gathered_bytes;
 
-			continue;
-
-		}
-
-		{
-
-			size_t bytes = my_new_count_ * esizes[vi];
-			void* gathered_ptr = vtasks_[vi].gathered;
-			size_t gathered_cap = vtasks_[vi].gathered_bytes;
-			pool_reserve(gathered_ptr, gathered_cap, bytes);
-			vtasks_[vi].gathered = static_cast<char*>(gathered_ptr);
-			vtasks_[vi].gathered_bytes = gathered_cap;
-
-		}
+		pool_reserve(gp, gc, bytes, /*preserve_data=*/false);
+		vtasks_[vi].gathered = static_cast<char*>(gp);
+		vtasks_[vi].gathered_bytes = gc;
 
 	}
 
@@ -1806,7 +1889,7 @@ void Resizer::redistribute_vecs() {
 
 		for (int vi = 0; vi < n; vi++) {
 
-			if (vec_shared_active[vi]) {
+			if (vmeta_[vi].shared_active) {
 
 				continue;
 
@@ -1821,7 +1904,7 @@ void Resizer::redistribute_vecs() {
 			auto& t = vtasks_[vi];
 			long bytes64 = tr.v_count * (long)t.esz;
 
-			if (bytes64 > INT_MAX) {
+			if (MAL_UNLIKELY(bytes64 > INT_MAX)) {
 
 				MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Transfer size overflow (%ld bytes) in redistribute_vecs", bytes64);
 				MPI_Abort(g.comm.universe, 1);
@@ -1843,9 +1926,9 @@ void Resizer::redistribute_vecs() {
 				if (tr.old_rank == g.comm.u_rank && send_base && t.gathered) {
 
 					long src_off = (tr.v_start - old_vs[g.comm.u_rank]) * (long)t.esz;
-					long dst_off = (tr.v_start - my_new_vs_ ) * (long)t.esz;
+					long dst_off = (tr.v_start - my_new_vs_) * (long)t.esz;
 
-					std::memmove(t.gathered + dst_off, send_base + src_off, byte_count);
+					std::memmove(static_cast<char*>(t.gathered) + dst_off, send_base + src_off, byte_count);
 
 				}
 
@@ -1865,7 +1948,7 @@ void Resizer::redistribute_vecs() {
 
 			if (tr.new_rank == g.comm.u_rank && t.gathered) {
 
-				char* dst = t.gathered + (tr.v_start - my_new_vs_) * (long)t.esz;
+				char* dst = static_cast<char*>(t.gathered) + (tr.v_start - my_new_vs_) * (long)t.esz;
 
 				MPI_Request req;
 
@@ -1879,7 +1962,11 @@ void Resizer::redistribute_vecs() {
 
 	}
 
-	MPI_Waitall((int)reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+	if (!reqs.empty()) {
+
+		MPI_Waitall((int)reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+
+	}
 
 }
 
@@ -1899,7 +1986,11 @@ void Resizer::reduce_accs() {
 	new_epoch_bufs_.resize(n);
 
 	batched_allreduce(n,
-		[naccs](int k) -> MalAcc* { return k < naccs ? g.loop->accs[k] : nullptr; },
+		[naccs](int k) -> MalAcc* {
+
+			return k < naccs ? g.loop->accs[k] : nullptr;
+
+		},
 		[this, naccs](int k, const char* r, int esz) {
 
 			new_epoch_bufs_[k].assign(r, r + esz);
@@ -1915,7 +2006,8 @@ void Resizer::reduce_accs() {
 			a->epoch_buf.assign(r, r + esz);
 			a->fn_reset(a->ptr);
 
-		});
+		}
+	);
 
 }
 
@@ -1974,20 +2066,15 @@ void Resizer::apply_active() {
 				for (auto [g_start, g_end] : assigned) {
 
 					long len = g_end - g_start;
+					long src_off = g_start - my_new_vs_;
 
-					if (len > 0) {
+					if (len > 0 && src_off >= 0 && src_off + len <= my_new_count_) {
 
-						long src_off = g_start - my_new_vs_;
-
-						if (src_off >= 0 && src_off + len <= my_new_count_) {
-
-							std::memcpy(static_cast<char*>(t.v->buf) + buf_off * t.esz, static_cast<char*>(t.gathered) + src_off * t.esz, len * t.esz);
-
-						}
-
-						buf_off += len;
+						std::memcpy(static_cast<char*>(t.v->buf) + buf_off * t.esz, static_cast<char*>(t.gathered) + src_off * t.esz, len * t.esz);
 
 					}
+
+					buf_off += len;
 
 				}
 
@@ -1999,6 +2086,7 @@ void Resizer::apply_active() {
 			if (t.v->access_mode == MAL_ACCESS_READ_ONLY && !assigned.empty()) {
 
 				long total_len = 0;
+
 				for (const auto& rg : assigned) {
 
 					total_len += std::max(0L, rg.second - rg.first);
@@ -2085,13 +2173,16 @@ void Resizer::apply_active() {
 		pa->ranges = std::move(assigned);
 		pa->range_local_bases.clear();
 		pa->range_local_bases.reserve(pa->ranges.size());
+
 		long local_base = 0;
+
 		for (const auto& rg : pa->ranges) {
 
 			pa->range_local_bases.push_back(local_base);
 			local_base += rg.second - rg.first;
 
 		}
+
 		pa->vec_slices.resize(vtasks_.size(), nullptr);
 		pa->vec_slice_bytes.resize(vtasks_.size(), 0);
 
@@ -2160,8 +2251,12 @@ void Resizer::broadcast_shared_mats() {
 
 	MPI_Bcast(tots.data(), n_shared * (int)sizeof(size_t), MPI_BYTE, 0, g.comm.active);
 
-	if (is_new) g.pending->shared_mats.reserve(n_shared);
-	if (is_new) g.pending->shared_mat_bytes.reserve(n_shared);
+	if (is_new) {
+
+		g.pending->shared_mats.reserve(n_shared);
+		g.pending->shared_mat_bytes.reserve(n_shared);
+
+	}
 
 	for (int si = 0; si < n_shared; si++) {
 
@@ -2213,7 +2308,7 @@ void Resizer::broadcast_shared_vecs() {
 
 			size_t b = (size_t)std::max(0L, v->total_N) * v->elem_size;
 
-			if (b > (size_t)INT_MAX) {
+			if (MAL_UNLIKELY(b > (size_t)INT_MAX)) {
 
 				MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector size overflow (%zu bytes)", b);
 				MPI_Abort(g.comm.universe, 1);
@@ -2246,7 +2341,7 @@ void Resizer::broadcast_shared_vecs() {
 		int vi = idxs[k];
 		int nbytes = bytes[k];
 
-		if (vi < 0 || vi >= (int)g.vecs.size()) {
+		if (MAL_UNLIKELY(vi < 0 || vi >= (int)g.vecs.size())) {
 
 			MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector index out of range: %d", vi);
 			MPI_Abort(g.comm.universe, 1);
@@ -2255,15 +2350,15 @@ void Resizer::broadcast_shared_vecs() {
 
 		MalVec* v = g.vecs[vi].get();
 
-		if (!v) {
+		if (MAL_UNLIKELY(!v)) {
 
 			MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector missing at index %d", vi);
 			MPI_Abort(g.comm.universe, 1);
 
 		}
 
-			size_t buf_need = (size_t)std::max(1L, v->total_N) * v->elem_size;
-			pool_reserve(v->buf, v->buf_bytes, buf_need);
+		size_t buf_need = (size_t)std::max(1L, v->total_N) * v->elem_size;
+		pool_reserve(v->buf, v->buf_bytes, buf_need);
 		v->local_n = v->total_N;
 		v->done_n = 0;
 		v->buf_global_start = 0;
@@ -2325,6 +2420,7 @@ void Resizer::apply_inactive() {
 		} else {
 
 			t.v->cache_valid = false;
+
 			size_t buf_need = (size_t)std::max(1L, t.v->done_n) * t.esz;
 			pool_reserve(t.v->buf, t.v->buf_bytes, buf_need);
 			t.v->local_n = t.v->done_n;
@@ -2386,6 +2482,7 @@ void Resizer::run() {
 	MPI_Barrier(g.comm.universe);
 
 	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "Starting resize to %d (current=%d)", target_, g.comm.a_size);
+
 	double t0 = MPI_Wtime();
 
 	old_a_size_ = g.comm.a_size;
@@ -2445,16 +2542,22 @@ static void progress_thread() {
 			std::deque<std::shared_ptr<MalState::AsyncBcastTask>> batch;
 
 			{
+
 				std::lock_guard lk(g.attach_mu);
+
 				if (g.attach_tasks.empty()) {
+
 					g.sync.attach_pending = false;
 					g.sync.notify();
 					break;
+
 				}
+
 				batch.swap(g.attach_tasks);
+
 			}
 
-			g.attach_inflight.fetch_add((int)batch.size());
+			g.attach_inflight.fetch_add((int)batch.size(), std::memory_order_relaxed);
 
 			for (auto& task : batch) {
 
@@ -2467,24 +2570,24 @@ static void progress_thread() {
 				if (task) {
 
 					{
+
 						std::lock_guard lk(task->mu);
 						task->done = true;
+
 					}
 
 					task->cv.notify_all();
 
 				}
 
-				g.sync.notify();
-
 			}
 
-			g.attach_inflight.fetch_sub((int)batch.size());
+			g.attach_inflight.fetch_sub((int)batch.size(), std::memory_order_release);
 			g.sync.notify();
 
 		}
 
-		const int wait_ms = g.cfg.epoch_ms.load();
+		const int wait_ms = g.cfg.epoch_ms.load(std::memory_order_relaxed);
 
 		{
 
@@ -2533,8 +2636,10 @@ static void progress_thread() {
 			bool done = false;
 
 			{
+
 				std::lock_guard lk(g.cfg.mu);
 				done = (++g.cfg.seq_idx >= g.cfg.sequence.size());
+
 			}
 
 			if (done) {
@@ -2550,6 +2655,7 @@ static void progress_thread() {
 		}
 
 		g.sync.notify();
+
 	}
 
 	g.sync.notify();
@@ -2776,6 +2882,7 @@ void mal_init() {
 }
 
 static void vec_scatter(MalVec& v, const void* root_data) {
+
 	std::vector<int> sc, sd;
 
 	if (g.comm.a_rank == 0) {
@@ -2793,6 +2900,7 @@ static void vec_scatter(MalVec& v, const void* root_data) {
 		sd = make_displs(sc);
 
 	}
+
 	int rc = (int)(v.local_n * (long)v.elem_size);
 
 	MPI_Scatterv(root_data, g.comm.a_rank == 0 ? sc.data() : nullptr, g.comm.a_rank == 0 ? sd.data() : nullptr, MPI_BYTE, v.buf, rc, MPI_BYTE, 0, g.comm.active);
@@ -2825,12 +2933,12 @@ static void vec_gather(MalVec& v) {
 	const bool root = (g.comm.u_rank == v.gather_root);
 
 	std::vector<long> my_seg_flat;
-
 	my_seg_flat.reserve(v.done_segs.size() * 2);
 
 	for (auto [s, c] : v.done_segs) {
 
-		my_seg_flat.push_back(s); my_seg_flat.push_back(c);
+		my_seg_flat.push_back(s);
+		my_seg_flat.push_back(c);
 
 	}
 
@@ -2860,7 +2968,9 @@ static void vec_gather(MalVec& v) {
 	long my_data_bytes = v.local_n * (long)v.elem_size;
 
 	std::vector<int> data_counts, data_displs;
-	std::vector<char> recv_buf;
+
+	void* recv_raw = nullptr;
+	size_t recv_cap = 0;
 
 	if (root) {
 
@@ -2870,9 +2980,9 @@ static void vec_gather(MalVec& v) {
 
 			long total = 0;
 
-			for (int s = 0; s < seg_counts[k]/2; ++s) {
+			for (int s = 0; s < seg_counts[k] / 2; ++s) {
 
-				total += all_segs[seg_displs[k] + s*2 + 1];
+				total += all_segs[seg_displs[k] + s * 2 + 1];
 
 			}
 
@@ -2881,29 +2991,39 @@ static void vec_gather(MalVec& v) {
 		}
 
 		data_displs = make_displs(data_counts);
-		recv_buf.resize(data_displs.back() + data_counts.back());
+
+		size_t total_recv = (size_t)(data_displs.back() + data_counts.back());
+		pool_reserve(recv_raw, recv_cap, total_recv > 0 ? total_recv : 1, /*preserve_data=*/false);
 
 	}
 
-	MPI_Gatherv(my_data_bytes > 0 ? v.buf : nullptr, (int)my_data_bytes, MPI_BYTE, recv_buf.empty() ? nullptr : recv_buf.data(), data_counts.empty() ? nullptr : data_counts.data(), data_displs.empty() ? nullptr : data_displs.data(), MPI_BYTE, v.gather_root, g.comm.universe);
+	MPI_Gatherv(my_data_bytes > 0 ? v.buf : nullptr, (int)my_data_bytes, MPI_BYTE, recv_raw, root ? data_counts.data() : nullptr, root ? data_displs.data() : nullptr, MPI_BYTE, v.gather_root, g.comm.universe);
 
 	if (root && v.result_buf) {
 
+		char* recv_buf = static_cast<char*>(recv_raw);
 		long data_off = 0;
 
 		for (int k = 0; k < usiz; ++k) {
 
-			for (int s = 0; s < seg_counts[k]/2; ++s) {
+			for (int s = 0; s < seg_counts[k] / 2; ++s) {
 
-				long gs = all_segs[seg_displs[k] + s*2];
-				long cnt = all_segs[seg_displs[k] + s*2 + 1];
+				long gs = all_segs[seg_displs[k] + s * 2];
+				long cnt = all_segs[seg_displs[k] + s * 2 + 1];
 
-				std::memcpy(static_cast<char*>(v.result_buf) + gs * (long)v.elem_size, recv_buf.data() + data_off, cnt * (long)v.elem_size);
+				std::memcpy(static_cast<char*>(v.result_buf) + gs * (long)v.elem_size, recv_buf + data_off, cnt * (long)v.elem_size);
+
 				data_off += cnt * (long)v.elem_size;
 
 			}
 
 		}
+
+	}
+
+	if (recv_raw) {
+
+		g_buffer_pool.release(recv_raw, recv_cap);
 
 	}
 
@@ -2951,14 +3071,21 @@ void mal_finalize() {
 	int naccs = (int)g.accs.size();
 
 	MPI_Bcast(&naccs, 1, MPI_INT, 0, g.comm.universe);
+
 	batched_allreduce(naccs,
-		[](int k) -> MalAcc* { return g.accs[k].get(); },
+		[](int k) -> MalAcc* {
+
+			return g.accs[k].get();
+
+		},
 		[](int k, const char* r, int) {
 
 			MalAcc* a = g.accs[k].get();
 
 			if (!a->ptr) {
+
 				return;
+
 			}
 
 			if (g.comm.u_rank == a->result_rank) {
@@ -3029,6 +3156,7 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 		if (g.pending->ranges.size() > 1) {
 
 			f.extra_ranges.assign(g.pending->ranges.begin() + 1, g.pending->ranges.end());
+
 			if (g.pending->range_local_bases.size() > 1) {
 
 				f.extra_range_local_bases.assign(g.pending->range_local_bases.begin() + 1, g.pending->range_local_bases.end());
@@ -3079,6 +3207,7 @@ static void advance_next_range(MalFor& f) {
 
 	f.start = a;
 	f.range_local_base = (idx < f.extra_range_local_bases.size()) ? f.extra_range_local_bases[idx] : 0;
+
 	sync_vec_mapping_for_current_range(f);
 
 	set_limit(f, b);
@@ -3103,7 +3232,7 @@ void mal_check_for(MalFor& f) {
 
 	f.current = *f.user_iter;
 
-	if (g.sync.resize_pending) {
+	if (MAL_UNLIKELY(g.sync.resize_pending)) {
 
 		g.sync.compute_wait([] {
 
@@ -3122,7 +3251,7 @@ void mal_check_for(MalFor& f) {
 
 	}
 
-	if (*f.user_iter + 1 < f.end) {
+	if (MAL_LIKELY(*f.user_iter + 1 < f.end)) {
 
 		return;
 
@@ -3182,13 +3311,13 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 	const bool shared_active = (policy == MAL_ATTACH_SHARED_ACTIVE);
 	bool once_all = (policy == MAL_ATTACH_SHARED_ALL);
 
-	if (elem_size == 0) {
+	if (MAL_UNLIKELY(elem_size == 0)) {
 
 		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "mal_attach_vec called with elem_size=0");
 
 	}
 
-	if (total_N < 0) {
+	if (MAL_UNLIKELY(total_N < 0)) {
 
 		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "mal_attach_vec called with negative total_N=%ld", total_N);
 
@@ -3196,8 +3325,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	if ((once_all || shared_active) && result_rank >= 0) {
 
-		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Shared vector policy ignores gather result_rank=%d", result_rank);
-		once_all = false;
+		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Shared vector policy ignores gather result_rank=%d", result_rank); once_all = false;
 		result_rank = -1;
 
 	}
@@ -3220,7 +3348,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	if (g.pending && idx < (int)g.pending->vec_slices.size()) {
 
-		auto stash = g.pending->vec_slices[idx];
+		void* stash = g.pending->vec_slices[idx];
 		size_t stash_bytes = (idx < (int)g.pending->vec_slice_bytes.size()) ? g.pending->vec_slice_bytes[idx] : 0;
 
 		if (stash && n > 0) {
@@ -3229,6 +3357,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 			g_buffer_pool.release(stash, stash_bytes);
 
 			g.pending->vec_slices[idx] = nullptr;
+
 			if (idx < (int)g.pending->vec_slice_bytes.size()) {
 
 				g.pending->vec_slice_bytes[idx] = 0;
@@ -3297,6 +3426,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 		}
 
 		const bool wait = !use_async_attach_mode(exec_mode);
+
 		auto task = enqueue_attach_task([v, total_bytes] {
 
 			if (g.comm.active == MPI_COMM_NULL || total_bytes == 0) {
@@ -3325,8 +3455,8 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 		const int do_scatter = (orig && result_rank < 0) ? 1 : 0;
 		const bool wait = !use_async_attach_mode(exec_mode);
-
 		size_t orig_bytes = (size_t)std::max(0L, total_N) * elem_size;
+
 		auto task = enqueue_attach_task([v, do_scatter, orig, result_rank, orig_bytes] {
 
 			if (g.comm.active == MPI_COMM_NULL) {
@@ -3408,7 +3538,7 @@ void detail::acc_register(MalFor& f, detail::AccDesc d, int result_rank) {
 
 void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
 
-	if (elem_size == 0 || primary_n < 0 || secondary_n < 0) {
+	if (MAL_UNLIKELY(elem_size == 0 || primary_n < 0 || secondary_n < 0)) {
 
 		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "mal_attach_mat called with invalid shape/size elem_size=%zu primary_n=%ld secondary_n=%ld", elem_size, primary_n, secondary_n);
 
@@ -3477,6 +3607,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 			buf = (g.comm.a_rank == 0 && orig) ? orig : g_buffer_pool.acquire(total_bytes > 0 ? total_bytes : 1);
 
 			const bool wait = !use_async_attach_mode(exec_mode);
+
 			auto task = enqueue_attach_task([buf, total_bytes] {
 
 				if (g.comm.active != MPI_COMM_NULL) {
@@ -3504,7 +3635,6 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 	}
 
 	auto sp = std::make_unique<SharedMat>();
-
 	sp->buf = buf;
 	sp->total_bytes = total_bytes;
 	sp->user_owned = shared_all ? (g.comm.u_rank == 0 && orig != nullptr) : (g.comm.a_rank == 0 && orig != nullptr);
@@ -3524,7 +3654,7 @@ void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, Mal
 
 	(void)exec_mode;
 
-	if (halo <= 0) {
+	if (MAL_UNLIKELY(halo <= 0)) {
 
 		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Ignoring halo attach with halo=%d (must be > 0)", halo);
 
@@ -3545,7 +3675,7 @@ void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, Mal
 
 	}
 
-	if (!v) {
+	if (MAL_UNLIKELY(!v)) {
 
 		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Ignoring halo attach: vector pointer was not previously attached");
 
@@ -3566,6 +3696,7 @@ void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, Mal
 
 	long new_asgn = v->local_n - v->done_n;
 	size_t bytes = (size_t)std::max(1L, (new_asgn + 2L * halo) * (long)v->elem_size);
+
 	v->halo_buf = g_buffer_pool.acquire(bytes);
 	v->halo_buf_bytes = bytes;
 
@@ -3592,6 +3723,84 @@ void mal_exchange_halo(MalFor& f) {
 	if (g.comm.active == MPI_COMM_NULL) {
 
 		return;
+
+	}
+
+	std::vector<MPI_Request> all_reqs;
+	all_reqs.reserve((size_t)f.vecs.size() * 4);
+
+	for (int vi = 0; vi < (int)f.vecs.size(); ++vi) {
+
+		MalVec& v = *f.vecs[vi];
+
+		if (v.halo_n <= 0 || !v.halo_buf) {
+
+			continue;
+
+		}
+
+		if (v.halo_static_once && v.halo_initialized) {
+
+			continue;
+
+		}
+
+		if (v.fully_replicated) {
+
+			continue;
+
+		}
+
+		int h = v.halo_n;
+		long esz = (long)v.elem_size;
+		long new_asgn = v.local_n - v.done_n;
+
+		if (new_asgn < h) {
+
+			continue;
+
+		}
+
+		size_t needed_bytes = (size_t)std::max(1L, (new_asgn + 2L * h) * esz);
+
+		if (needed_bytes != v.halo_buf_bytes) {
+
+			if (v.halo_buf && v.halo_buf_bytes > 0) {
+
+				g_buffer_pool.release(v.halo_buf, v.halo_buf_bytes);
+
+			}
+
+			v.halo_buf = g_buffer_pool.acquire(needed_bytes);
+			v.halo_buf_bytes = needed_bytes;
+
+		}
+
+		char* hb = static_cast<char*>(v.halo_buf);
+		char* owned = static_cast<char*>(v.buf) + v.done_n * esz;
+		int cnt = (int)(h * esz);
+		int lnbr = v.halo_lnbr;
+		int rnbr = v.halo_rnbr;
+
+		std::memcpy(hb + h * esz, owned, (size_t)(new_asgn * esz));
+
+		MPI_Request r0, r1, r2, r3;
+
+		MPI_Irecv(hb, cnt, MPI_BYTE, lnbr, vi*2, g.comm.active, &r0);
+		MPI_Isend(owned + (new_asgn - h) * esz, cnt, MPI_BYTE, rnbr, vi*2, g.comm.active, &r1);
+		MPI_Irecv(hb + (h + new_asgn) * esz, cnt, MPI_BYTE, rnbr, vi*2+1, g.comm.active, &r2);
+		MPI_Isend(owned, cnt, MPI_BYTE, lnbr, vi*2+1, g.comm.active, &r3);
+
+		all_reqs.push_back(r0);
+		all_reqs.push_back(r1);
+		all_reqs.push_back(r2);
+		all_reqs.push_back(r3);
+
+	}
+
+	if (!all_reqs.empty()) {
+
+		MPI_Waitall((int)all_reqs.size(), all_reqs.data(), MPI_STATUSES_IGNORE);
 
 	}
 
@@ -3627,38 +3836,10 @@ void mal_exchange_halo(MalFor& f) {
 
 		}
 
-		int lnbr = v.halo_lnbr;
-		int rnbr = v.halo_rnbr;
-
-		size_t needed_bytes = (size_t)std::max(1L, (new_asgn + 2L * h) * esz);
-
-		if (needed_bytes != v.halo_buf_bytes) {
-
-			void* new_buf = g_buffer_pool.acquire(needed_bytes);
-			if (v.halo_buf && v.halo_buf_bytes > 0) {
-
-				std::memcpy(new_buf, v.halo_buf, std::min(needed_bytes, v.halo_buf_bytes));
-				g_buffer_pool.release(v.halo_buf, v.halo_buf_bytes);
-
-			}
-			v.halo_buf = new_buf;
-			v.halo_buf_bytes = needed_bytes;
-
-		}
-
 		char* hb = static_cast<char*>(v.halo_buf);
 		char* owned = static_cast<char*>(v.buf) + v.done_n * esz;
-		int cnt = (int)(h * esz);
-
-		std::memcpy(hb + h * esz, owned, (size_t)(new_asgn * esz));
-
-		MPI_Request reqs[4];
-
-		MPI_Irecv(hb, cnt, MPI_BYTE, lnbr, vi*2, g.comm.active, &reqs[0]);
-		MPI_Isend(owned + (new_asgn - h) * esz, cnt, MPI_BYTE, rnbr, vi*2, g.comm.active, &reqs[1]);
-		MPI_Irecv(hb + (h + new_asgn) * esz, cnt, MPI_BYTE, rnbr, vi*2+1, g.comm.active, &reqs[2]);
-		MPI_Isend(owned, cnt, MPI_BYTE, lnbr, vi*2+1, g.comm.active, &reqs[3]);
-		MPI_Waitall(4, reqs, MPI_STATUSES_IGNORE);
+		int lnbr = v.halo_lnbr;
+		int rnbr = v.halo_rnbr;
 
 		if (v.halo_mode != MAL_HALO_PERIODIC) {
 
@@ -3679,6 +3860,7 @@ void mal_exchange_halo(MalFor& f) {
 				}
 
 			}
+
 			if (rnbr == MPI_PROC_NULL) {
 
 				char* rg = hb + (h + new_asgn) * esz;

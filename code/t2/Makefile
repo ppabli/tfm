@@ -3,7 +3,7 @@ MPIRUN = mpirun
 
 NP = 4
 
-CXXFLAGS = -O2 -Wall -std=c++17 -MMD -MP
+CXXFLAGS = -O2 -Wall -std=c++20 -MMD -MP
 LIBS = -l pthread
 
 BUILD_DIR = build
