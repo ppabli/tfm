@@ -128,6 +128,7 @@ struct MalData {
 struct MalVec : MalData {
 
 	void* buf{nullptr};
+	size_t buf_bytes{0};
 	size_t elem_size{0};
 	long local_n{0};
 	long done_n{0};
@@ -195,21 +196,29 @@ struct PendingActivation {
 	std::vector<std::pair<long,long>> ranges;
 	std::vector<long> range_local_bases;
 	std::vector<void*> vec_slices;
+	std::vector<size_t> vec_slice_bytes;
 	std::vector<std::vector<char>> acc_epoch_bufs;
 	std::vector<void*> shared_mats;
+	std::vector<size_t> shared_mat_bytes;
 	size_t acc_idx{0}, shared_idx{0};
 
 	~PendingActivation() {
 
-		for (void* p : vec_slices) {
+		for (size_t i = 0; i < vec_slices.size(); ++i) {
 
-			std::free(p);
+			void* p = vec_slices[i];
+			size_t cap = (i < vec_slice_bytes.size()) ? vec_slice_bytes[i] : 0;
+
+			g_buffer_pool.release(p, cap);
 
 		}
 
-		for (void* p : shared_mats) {
+		for (size_t i = 0; i < shared_mats.size(); ++i) {
 
-			std::free(p);
+			void* p = shared_mats[i];
+			size_t cap = (i < shared_mat_bytes.size()) ? shared_mat_bytes[i] : 0;
+
+			g_buffer_pool.release(p, cap);
 
 		}
 
@@ -218,6 +227,13 @@ struct PendingActivation {
 };
 
 struct MalState {
+
+	struct GatherCacheEntry {
+
+		char* ptr{nullptr};
+		size_t capacity{0};
+
+	};
 
 	struct AsyncBcastTask {
 
@@ -313,6 +329,7 @@ struct MalState {
 	std::vector<std::unique_ptr<MalVec>> vecs;
 	std::vector<std::unique_ptr<MalAcc>> accs;
 	std::vector<std::unique_ptr<SharedMat>> shared;
+	std::vector<GatherCacheEntry> gather_cache;
 
 	std::unique_ptr<PendingActivation> pending;
 
@@ -471,15 +488,34 @@ static void* checked_realloc(void* p, size_t n, const char* ctx) {
 
 }
 
-static void* pool_alloc(size_t bytes) {
+static void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes) {
 
-	return g_buffer_pool.acquire(bytes);
+	size_t need = std::max((size_t)1, min_bytes);
 
-}
+	if (ptr && capacity >= need) {
 
-static void pool_free(void* ptr, size_t capacity) {
+		return;
 
-	g_buffer_pool.release(ptr, capacity);
+	}
+
+	void* nb = g_buffer_pool.acquire(need);
+
+	if (ptr) {
+
+		size_t copy_bytes = std::min(capacity, need);
+
+		if (copy_bytes > 0) {
+
+			std::memcpy(nb, ptr, copy_bytes);
+
+		}
+
+		g_buffer_pool.release(ptr, capacity > 0 ? capacity : 1);
+
+	}
+
+	ptr = nb;
+	capacity = need;
 
 }
 
@@ -1135,14 +1171,15 @@ void MalVec::free_resources() {
 
 	if (buf) {
 
-		pool_free(buf, 0);
+		g_buffer_pool.release(buf, buf_bytes > 0 ? buf_bytes : 1);
 		buf = nullptr;
+		buf_bytes = 0;
 
 	}
 
 	if (halo_buf) {
 
-		pool_free(halo_buf, halo_buf_bytes);
+		g_buffer_pool.release(halo_buf, halo_buf_bytes);
 		halo_buf = nullptr;
 		halo_buf_bytes = 0;
 
@@ -1161,7 +1198,7 @@ void SharedMat::free_resources() {
 
 	if (!user_owned && buf) {
 
-		std::free(buf);
+		g_buffer_pool.release(buf, total_bytes > 0 ? total_bytes : 1);
 
 	}
 
@@ -1383,6 +1420,7 @@ class Resizer {
 	void apply_inactive();
 	void broadcast_shared_vecs();
 	void broadcast_shared_mats();
+	void stash_gather_cache();
 
 	int target_;
 	int old_a_size_{0};
@@ -1400,7 +1438,7 @@ public:
 
 			if (t.gathered) {
 
-				pool_free(t.gathered, t.gathered_bytes);
+				g_buffer_pool.release(t.gathered, t.gathered_bytes);
 
 			}
 
@@ -1590,12 +1628,21 @@ void Resizer::redistribute_vecs() {
 
 	vtasks_.resize(n);
 
+	if (g.gather_cache.size() < (size_t)n) {
+
+		g.gather_cache.resize((size_t)n);
+
+	}
+
 	for (int vi = 0; vi < n; vi++) {
 
 		auto& t = vtasks_[vi];
 
 		t.esz = esizes[vi];
 		t.v = (vi < nvecs) ? g.loop->vecs[vi] : nullptr;
+		t.gathered = g.gather_cache[(size_t)vi].ptr;
+		t.gathered_bytes = g.gather_cache[(size_t)vi].capacity;
+		g.gather_cache[(size_t)vi] = {};
 
 		if (vec_shared_active[vi]) {
 
@@ -1742,8 +1789,11 @@ void Resizer::redistribute_vecs() {
 		{
 
 			size_t bytes = my_new_count_ * esizes[vi];
-			vtasks_[vi].gathered = static_cast<char*>(pool_alloc(bytes));
-			vtasks_[vi].gathered_bytes = bytes;
+			void* gathered_ptr = vtasks_[vi].gathered;
+			size_t gathered_cap = vtasks_[vi].gathered_bytes;
+			pool_reserve(gathered_ptr, gathered_cap, bytes);
+			vtasks_[vi].gathered = static_cast<char*>(gathered_ptr);
+			vtasks_[vi].gathered_bytes = gathered_cap;
 
 		}
 
@@ -1891,7 +1941,8 @@ void Resizer::apply_active() {
 
 			if (t.v->attach_policy == MAL_ATTACH_SHARED_ACTIVE) {
 
-				t.v->buf = checked_realloc(t.v->buf, std::max(1L, t.v->total_N) * (long)t.esz, "apply_active.shared_active");
+				size_t buf_need = (size_t)std::max(1L, t.v->total_N) * t.esz;
+				pool_reserve(t.v->buf, t.v->buf_bytes, buf_need);
 				t.v->local_n = t.v->total_N;
 				t.v->done_n = 0;
 				t.v->buf_global_start = 0;
@@ -1899,8 +1950,6 @@ void Resizer::apply_active() {
 				t.v->fully_replicated = true;
 				t.v->cache_valid = false;
 				t.v->sync_user_ptr();
-
-				std::free(t.gathered); t.gathered = nullptr;
 
 				continue;
 
@@ -1915,7 +1964,8 @@ void Resizer::apply_active() {
 
 			}
 
-			t.v->buf = checked_realloc(t.v->buf, std::max(1L, new_local) * (long)t.esz, "apply_active");
+			size_t buf_need = (size_t)std::max(1L, new_local) * t.esz;
+			pool_reserve(t.v->buf, t.v->buf_bytes, buf_need);
 
 			if (new_asgn > 0 && !reused_local && t.gathered && !assigned.empty()) {
 
@@ -1984,8 +2034,6 @@ void Resizer::apply_active() {
 
 			t.v->sync_user_ptr();
 
-			std::free(t.gathered); t.gathered = nullptr;
-
 		}
 
 		if (!assigned.empty()) {
@@ -2045,6 +2093,7 @@ void Resizer::apply_active() {
 
 		}
 		pa->vec_slices.resize(vtasks_.size(), nullptr);
+		pa->vec_slice_bytes.resize(vtasks_.size(), 0);
 
 		for (int vi = 0; vi < (int)vtasks_.size(); vi++) {
 
@@ -2053,7 +2102,9 @@ void Resizer::apply_active() {
 			if (new_asgn > 0 && t.gathered && t.esz > 0) {
 
 				pa->vec_slices[vi] = t.gathered;
+				pa->vec_slice_bytes[vi] = t.gathered_bytes;
 				t.gathered = nullptr;
+				t.gathered_bytes = 0;
 
 			}
 
@@ -2110,15 +2161,21 @@ void Resizer::broadcast_shared_mats() {
 	MPI_Bcast(tots.data(), n_shared * (int)sizeof(size_t), MPI_BYTE, 0, g.comm.active);
 
 	if (is_new) g.pending->shared_mats.reserve(n_shared);
+	if (is_new) g.pending->shared_mat_bytes.reserve(n_shared);
 
 	for (int si = 0; si < n_shared; si++) {
 
 		size_t tot = tots[si];
-		void* buf = is_new ? std::malloc(tot > 0 ? tot : 1) : g.shared[si]->buf;
+		void* buf = is_new ? g_buffer_pool.acquire(tot > 0 ? tot : 1) : g.shared[si]->buf;
 
 		MPI_Bcast(buf, (int)tot, MPI_BYTE, 0, g.comm.active);
 
-		if (is_new) g.pending->shared_mats.push_back(buf);
+		if (is_new) {
+
+			g.pending->shared_mats.push_back(buf);
+			g.pending->shared_mat_bytes.push_back(tot > 0 ? tot : 1);
+
+		}
 
 	}
 
@@ -2205,7 +2262,8 @@ void Resizer::broadcast_shared_vecs() {
 
 		}
 
-		v->buf = checked_realloc(v->buf, std::max(1L, v->total_N) * (long)v->elem_size, "broadcast_shared_vecs");
+			size_t buf_need = (size_t)std::max(1L, v->total_N) * v->elem_size;
+			pool_reserve(v->buf, v->buf_bytes, buf_need);
 		v->local_n = v->total_N;
 		v->done_n = 0;
 		v->buf_global_start = 0;
@@ -2229,8 +2287,6 @@ void Resizer::apply_inactive() {
 	g.comm.a_size = 0;
 
 	for (auto& t : vtasks_) {
-
-		std::free(t.gathered); t.gathered = nullptr;
 
 		if (!t.v) {
 
@@ -2269,7 +2325,8 @@ void Resizer::apply_inactive() {
 		} else {
 
 			t.v->cache_valid = false;
-			t.v->buf = checked_realloc(t.v->buf, std::max(1L, t.v->done_n) * (long)t.esz, "apply_inactive");
+			size_t buf_need = (size_t)std::max(1L, t.v->done_n) * t.esz;
+			pool_reserve(t.v->buf, t.v->buf_bytes, buf_need);
 			t.v->local_n = t.v->done_n;
 
 		}
@@ -2285,6 +2342,35 @@ void Resizer::apply_inactive() {
 	}
 
 	g.sync.compute_ready = true;
+
+}
+
+void Resizer::stash_gather_cache() {
+
+	if (g.gather_cache.size() < vtasks_.size()) {
+
+		g.gather_cache.resize(vtasks_.size());
+
+	}
+
+	for (size_t i = 0; i < vtasks_.size(); ++i) {
+
+		auto& t = vtasks_[i];
+		auto& c = g.gather_cache[i];
+
+		if (c.ptr) {
+
+			g_buffer_pool.release(c.ptr, c.capacity);
+
+		}
+
+		c.ptr = t.gathered;
+		c.capacity = t.gathered_bytes;
+
+		t.gathered = nullptr;
+		t.gathered_bytes = 0;
+
+	}
 
 }
 
@@ -2330,6 +2416,8 @@ void Resizer::run() {
 		apply_inactive();
 
 	}
+
+	stash_gather_cache();
 
 	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "Resize to %d done in %.4f s", target_, MPI_Wtime() - t0);
 
@@ -2902,6 +2990,14 @@ void mal_finalize() {
 
 	}
 
+	for (auto& e : g.gather_cache) {
+
+		g_buffer_pool.release(e.ptr, e.capacity);
+
+	}
+
+	g.gather_cache.clear();
+
 	if (g.comm.active != MPI_COMM_NULL) {
 
 		MPI_Comm_free(&g.comm.active);
@@ -3116,7 +3212,8 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	}
 
-	v->buf = static_cast<char*>(pool_alloc((v->local_n > 0 ? (size_t)v->local_n : 1) * elem_size));
+	v->buf = static_cast<char*>(g_buffer_pool.acquire((v->local_n > 0 ? (size_t)v->local_n : 1) * elem_size));
+	v->buf_bytes = (v->local_n > 0 ? (size_t)v->local_n : 1) * elem_size;
 	v->plan_origin_n = v->done_n;
 
 	int idx = (int)f.vecs.size();
@@ -3124,13 +3221,19 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 	if (g.pending && idx < (int)g.pending->vec_slices.size()) {
 
 		auto stash = g.pending->vec_slices[idx];
+		size_t stash_bytes = (idx < (int)g.pending->vec_slice_bytes.size()) ? g.pending->vec_slice_bytes[idx] : 0;
 
 		if (stash && n > 0) {
 
 			std::memcpy(v->buf, stash, (size_t)n * elem_size);
-			std::free(stash);
+			g_buffer_pool.release(stash, stash_bytes);
 
 			g.pending->vec_slices[idx] = nullptr;
+			if (idx < (int)g.pending->vec_slice_bytes.size()) {
+
+				g.pending->vec_slice_bytes[idx] = 0;
+
+			}
 
 		}
 
@@ -3167,7 +3270,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 		if (g.comm.u_rank == 0 && orig && result_rank < 0) {
 
-			std::free(orig);
+			g_buffer_pool.release(orig, total_bytes);
 
 		}
 
@@ -3214,7 +3317,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 		if (g.comm.a_rank == 0 && orig) {
 
-			std::free(orig);
+			g_buffer_pool.release(orig, total_bytes);
 
 		}
 
@@ -3223,7 +3326,8 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 		const int do_scatter = (orig && result_rank < 0) ? 1 : 0;
 		const bool wait = !use_async_attach_mode(exec_mode);
 
-		auto task = enqueue_attach_task([v, do_scatter, orig, result_rank] {
+		size_t orig_bytes = (size_t)std::max(0L, total_N) * elem_size;
+		auto task = enqueue_attach_task([v, do_scatter, orig, result_rank, orig_bytes] {
 
 			if (g.comm.active == MPI_COMM_NULL) {
 
@@ -3240,7 +3344,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 				if (g.comm.u_rank == 0 && result_rank < 0 && orig) {
 
-					std::free(orig);
+					g_buffer_pool.release(orig, orig_bytes > 0 ? orig_bytes : 1);
 
 				}
 
@@ -3346,7 +3450,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 		if (shared_all) {
 
-			buf = std::malloc(total_bytes > 0 ? total_bytes : 1);
+			buf = g_buffer_pool.acquire(total_bytes > 0 ? total_bytes : 1);
 
 			if (total_bytes > 0) {
 
@@ -3370,7 +3474,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 		} else {
 
-			buf = (g.comm.a_rank == 0 && orig) ? orig : std::malloc(total_bytes > 0 ? total_bytes : 1);
+			buf = (g.comm.a_rank == 0 && orig) ? orig : g_buffer_pool.acquire(total_bytes > 0 ? total_bytes : 1);
 
 			const bool wait = !use_async_attach_mode(exec_mode);
 			auto task = enqueue_attach_task([buf, total_bytes] {
@@ -3462,7 +3566,7 @@ void mal_attach_halo(MalFor& f, void** user_ptr, int halo, MalHaloMode mode, Mal
 
 	long new_asgn = v->local_n - v->done_n;
 	size_t bytes = (size_t)std::max(1L, (new_asgn + 2L * halo) * (long)v->elem_size);
-	v->halo_buf = pool_alloc(bytes);
+	v->halo_buf = g_buffer_pool.acquire(bytes);
 	v->halo_buf_bytes = bytes;
 
 	compute_halo_neighbors(*v);
@@ -3530,11 +3634,11 @@ void mal_exchange_halo(MalFor& f) {
 
 		if (needed_bytes != v.halo_buf_bytes) {
 
-			void* new_buf = pool_alloc(needed_bytes);
+			void* new_buf = g_buffer_pool.acquire(needed_bytes);
 			if (v.halo_buf && v.halo_buf_bytes > 0) {
 
 				std::memcpy(new_buf, v.halo_buf, std::min(needed_bytes, v.halo_buf_bytes));
-				pool_free(v.halo_buf, v.halo_buf_bytes);
+				g_buffer_pool.release(v.halo_buf, v.halo_buf_bytes);
 
 			}
 			v.halo_buf = new_buf;
