@@ -17,6 +17,23 @@
 #include <unordered_map>
 #include <vector>
 #include <bit>
+#include <pthread.h>
+#include <optional>
+
+#ifdef __linux__
+
+	#include <sched.h>
+	#include <fstream>
+	#include <filesystem>
+
+#endif
+
+#ifdef __APPLE__
+
+	#include <mach/mach.h>
+	#include <mach/thread_policy.h>
+
+#endif
 
 static constexpr int kDefaultSeq[] = {2, 4, 4, 3, 1, 4};
 
@@ -184,7 +201,6 @@ public:
 };
 
 static BufferPool g_buffer_pool;
-
 
 struct MalData {
 
@@ -358,6 +374,10 @@ struct MalState {
 		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
 		std::mutex mu;
 
+		bool affinity_enabled{MAL_AFFINITY_ENABLED != 0};
+		int main_core{MAL_MAIN_CORE_DEFAULT};
+		int worker_core{MAL_WORKER_CORE_DEFAULT};
+
 	} cfg;
 
 	struct SyncBarrier {
@@ -437,6 +457,252 @@ struct MalState {
 
 static MalState g;
 
+#ifdef __linux__
+
+	static std::optional<int> linux_find_core_by_metric(bool want_max) noexcept {
+
+		struct CoreInfo {
+			int id{-1};
+			unsigned long metric{0};
+		};
+
+		CoreInfo best{ -1, want_max ? 0UL : ULONG_MAX };
+		bool found = false;
+
+		auto try_sysfs = [&](const std::string& sysfs_file) {
+
+			CoreInfo candidate{ -1, want_max ? 0UL : ULONG_MAX };
+			bool any = false;
+
+			try {
+
+				for (const auto& entry : std::filesystem::directory_iterator("/sys/devices/system/cpu/")) {
+
+					const std::string name = entry.path().filename().string();
+
+					if (name.size() < 4 || name.substr(0, 3) != "cpu") {
+
+						continue;
+
+					}
+
+					if (!std::isdigit((unsigned char)name[3])) {
+
+						continue;
+
+					}
+
+					int id = -1;
+					try {
+
+						id = std::stoi(name.substr(3));
+
+					} catch (...) {
+
+						continue;
+
+					}
+
+					std::ifstream f(entry.path() / sysfs_file);
+					if (!f.is_open()) {
+
+						continue;
+
+					}
+
+					unsigned long val = 0;
+					f >> val;
+
+					if (!f) {
+
+						continue;
+
+					}
+
+
+					any = true;
+
+					if (want_max ? (val > candidate.metric) : (val < candidate.metric)) {
+
+						candidate = {id, val};
+
+					}
+
+				}
+
+			} catch (...) {}
+
+			if (any && candidate.id >= 0) {
+
+				best = candidate;
+				found = true;
+
+			}
+
+			return found;
+
+		};
+
+		try_sysfs("cpu_capacity") || try_sysfs("cpufreq/base_frequency");
+		return found ? std::optional<int>(best.id) : std::nullopt;
+
+	}
+
+	static void linux_pin_thread(pthread_t pt, int core_id, const char* label) noexcept {
+
+		cpu_set_t cpuset;
+		CPU_ZERO(&cpuset);
+		CPU_SET(core_id, &cpuset);
+
+		int rc = pthread_setaffinity_np(pt, sizeof(cpu_set_t), &cpuset);
+
+		if (rc != 0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "AFFINITY", "%s: failed to pin to core %d (err=%d)", label, core_id, rc);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: hard-pinned to core %d", label, core_id);
+
+		}
+
+	}
+
+	static void linux_pin(pthread_t pt, bool want_pcore, int core_cfg, const char* label) noexcept {
+
+		int core_id = core_cfg;
+
+		if (core_id < 0) {
+
+			if (auto core = linux_find_core_by_metric(want_pcore)) {
+
+				core_id = *core;
+				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: auto-detected %s at index %d", label, want_pcore ? "P-Core" : "E-Core", core_id);
+
+			} else {
+
+				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: no %s detected, thread unpinned", label, want_pcore ? "P-Core" : "E-Core");
+				return;
+
+			}
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: using configured core %d", label, core_id);
+
+		}
+
+		linux_pin_thread(pt, core_id, label);
+
+	}
+
+#endif
+
+#ifdef __APPLE__
+
+	static void apple_pin(bool is_self, bool want_pcore, const char* label) noexcept {
+
+		#if defined(__x86_64__) || defined(__i386__)
+
+			if (!is_self) {
+
+				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: Intel Mac affinity hint will be set from within the thread", label);
+				return;
+
+			}
+
+			mach_port_t mach_thread = mach_thread_self();
+			thread_affinity_policy_data_t policy = { want_pcore ? 2 : 1 };
+
+			kern_return_t kr = thread_policy_set(
+				mach_thread,
+				THREAD_AFFINITY_POLICY,
+				(thread_policy_t)&policy,
+				THREAD_AFFINITY_POLICY_COUNT
+			);
+
+			mach_port_deallocate(mach_task_self(), mach_thread);
+
+			if (kr != KERN_SUCCESS) {
+
+				MAL_LOG_L(MAL_LOG_WARN, "AFFINITY", "%s: thread_policy_set failed (kr=%d)", label, kr);
+
+			} else {
+
+				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: affinity hint set to %s", label, want_pcore ? "P-Core" : "E-Core");
+
+			}
+
+		#elif defined(__arm64__) || defined(__aarch64__)
+
+			if (!is_self) {
+
+				return;
+
+			}
+
+			qos_class_t qos = want_pcore ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_BACKGROUND;
+
+			pthread_set_qos_class_self_np(qos, 0);
+
+			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: QoS set to %s", label, want_pcore ? "USER_INTERACTIVE (P-Core)" : "BACKGROUND (E-Core)");
+
+		#else
+
+			(void)is_self;
+			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: unknown Apple architecture, thread unpinned", label);
+
+		#endif
+
+	}
+
+#endif
+
+static void pin_main_thread_to_pcore() noexcept {
+
+	if (!g.cfg.affinity_enabled) {
+
+		MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "main: pinning disabled");
+		return;
+
+	}
+
+	#ifdef __linux__
+
+		linux_pin(pthread_self(), /*want_pcore=*/true, g.cfg.main_core, "main");
+
+	#endif
+
+	#ifdef __APPLE__
+
+		apple_pin(/*is_self=*/true, /*want_pcore=*/true, "main");
+
+	#endif
+
+}
+
+static void pin_worker_thread_to_ecore(std::thread& t) noexcept {
+
+	if (!g.cfg.affinity_enabled) {
+		MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "worker: pinning disabled");
+		return;
+	}
+
+	#ifdef __linux__
+
+		linux_pin(t.native_handle(), /*want_pcore=*/false, g.cfg.worker_core, "worker");
+
+	#endif
+
+	#ifdef __APPLE__
+
+		(void)t;
+		apple_pin(/*is_self=*/false, /*want_pcore=*/false, "worker");
+
+	#endif
+
+}
+
 int mal_rank() {
 
 	return g.comm.u_rank;
@@ -482,6 +748,19 @@ const char* mal_log_reset_color() {
 static const MPI_Datatype kDtypeTbl[] = {MPI_INT, MPI_LONG, MPI_LONG_LONG, MPI_UNSIGNED, MPI_UNSIGNED_LONG, MPI_FLOAT, MPI_DOUBLE};
 
 static const MPI_Op kDopTbl[] = {MPI_SUM, MPI_PROD, MPI_MAX, MPI_MIN};
+
+static constexpr int kDtypeINT = 0;
+static constexpr int kDtypeLONG = 1;
+static constexpr int kDtypeLLONG = 2;
+static constexpr int kDtypeUINT = 3;
+static constexpr int kDtypeULONG = 4;
+static constexpr int kDtypeFLOAT = 5;
+static constexpr int kDtypeDOUBLE = 6;
+
+static constexpr int kDopSUM = 0;
+static constexpr int kDopPROD = 1;
+static constexpr int kDopMAX = 2;
+static constexpr int kDopMIN = 3;
 
 static MPI_Datatype tag_dtype(int t) noexcept {
 
@@ -533,43 +812,43 @@ static void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
 
 	switch (dop_tag) {
 
-		case 0: break;
+		case kDopSUM: break;
 
-		case 1:
+		case kDopPROD:
 
 			switch (dtype_tag) {
 
-				case 5: v.f = 1.0f; break;
-				case 6: v.d = 1.0; break;
+				case kDtypeFLOAT: v.f = 1.0f; break;
+				case kDtypeDOUBLE: v.d = 1.0; break;
 				default: v.l = 1; break;
 
 			} break;
 
-		case 2:
+		case kDopMAX:
 
 			switch (dtype_tag) {
 
-				case 0: v.i = INT_MIN; break;
-				case 1: v.l = LONG_MIN; break;
-				case 2: v.ll = LLONG_MIN; break;
-				case 3: v.u = 0; break;
-				case 4: v.ul = 0; break;
-				case 5: v.f = -FLT_MAX; break;
-				case 6: v.d = -DBL_MAX; break;
+				case kDtypeINT: v.i = INT_MIN; break;
+				case kDtypeLONG: v.l = LONG_MIN; break;
+				case kDtypeLLONG: v.ll = LLONG_MIN; break;
+				case kDtypeUINT: v.u = 0; break;
+				case kDtypeULONG: v.ul = 0; break;
+				case kDtypeFLOAT: v.f = -FLT_MAX; break;
+				case kDtypeDOUBLE: v.d = -DBL_MAX; break;
 
 			} break;
 
-		case 3:
+		case kDopMIN:
 
 			switch (dtype_tag) {
 
-				case 0: v.i = INT_MAX; break;
-				case 1: v.l = LONG_MAX; break;
-				case 2: v.ll = LLONG_MAX; break;
-				case 3: v.u = UINT_MAX; break;
-				case 4: v.ul = ULONG_MAX; break;
-				case 5: v.f = FLT_MAX; break;
-				case 6: v.d = DBL_MAX; break;
+				case kDtypeINT: v.i = INT_MAX; break;
+				case kDtypeLONG: v.l = LONG_MAX; break;
+				case kDtypeLLONG: v.ll = LLONG_MAX; break;
+				case kDtypeUINT: v.u = UINT_MAX; break;
+				case kDtypeULONG: v.ul = ULONG_MAX; break;
+				case kDtypeFLOAT: v.f = FLT_MAX; break;
+				case kDtypeDOUBLE: v.d = DBL_MAX; break;
 
 			} break;
 
@@ -1259,6 +1538,13 @@ void mal_check_for(MalForND& f) {
 }
 
 MalFor& mal_for_nd_base(MalForND& f) {
+
+	if (MAL_UNLIKELY(!f.base)) {
+
+		MAL_LOG(MAL_LOG_ERROR, "mal_for_nd_base called on uninitialized MalForND (base is null)");
+		std::abort();
+
+	}
 
 	return *f.base;
 
@@ -2522,6 +2808,29 @@ void Resizer::run() {
 
 static void progress_thread() {
 
+	#ifdef __APPLE__
+
+		if (g.cfg.affinity_enabled) {
+
+			#if defined(__arm64__) || defined(__aarch64__)
+
+				pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "worker: QoS set to BACKGROUND (E-Core)");
+
+			#elif defined(__x86_64__) || defined(__i386__)
+
+				mach_port_t self = mach_thread_self();
+				thread_affinity_policy_data_t policy = { 1 };
+				thread_policy_set(self, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
+				mach_port_deallocate(mach_task_self(), self);
+				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "worker: affinity hint set to E-Core");
+
+			#endif
+
+		}
+
+	#endif
+
 	{
 
 		std::lock_guard lk(g.cfg.mu);
@@ -2768,6 +3077,7 @@ static void load_env_config() {
 		if (ms > 0) {
 
 			g.cfg.epoch_ms.store((int)ms);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_EPOCH_INTERVAL_MS=%ld", ms);
 
 		} else {
 
@@ -2779,21 +3089,24 @@ static void load_env_config() {
 
 	if (const char* v = std::getenv("MAL_RESIZE_ENABLED")) {
 
-		g.cfg.enabled.store(std::strtol(v, nullptr, 10) != 0);
+		bool val = std::strtol(v, nullptr, 10) != 0;
+		g.cfg.enabled.store(val);
+		MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_RESIZE_ENABLED=%d", (int)val);
 
 	}
 
 	if (const char* v = std::getenv("MAL_RESIZE_SEQ")) {
 
 		std::vector<int> seq;
+		const char* p = v;
 		char* end;
 		bool found_invalid = false;
 
-		while (*v) {
+		while (*p) {
 
-			long n = std::strtol(v, &end, 10);
+			long n = std::strtol(p, &end, 10);
 
-			if (end == v) {
+			if (end == p) {
 
 				found_invalid = true;
 				break;
@@ -2810,25 +3123,83 @@ static void load_env_config() {
 
 			}
 
-			v = end;
+			p = end;
+			while (*p == ',' || *p == ' ') {
 
-			while (*v == ',' || *v == ' ') ++v;
+				++p;
+
+			}
 
 		}
 
 		if (!seq.empty()) {
 
 			mal_set_resize_sequence(seq.data(), seq.size());
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_RESIZE_SEQ loaded (%zu entries)", seq.size());
 
 		} else {
 
-			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_RESIZE_SEQ because it has no valid positive targets");
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_RESIZE_SEQ: no valid positive targets");
 
 		}
 
 		if (found_invalid) {
 
-			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "MAL_RESIZE_SEQ contains invalid tokens and/or non-positive values");
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "MAL_RESIZE_SEQ contains invalid or non-positive tokens");
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AFFINITY")) {
+
+		char* end = nullptr;
+		long val = std::strtol(v, &end, 10);
+
+		if (end == v) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AFFINITY='%s' (invalid), using compile-time default (%d)", v, MAL_AFFINITY_ENABLED);
+
+		} else {
+
+			g.cfg.affinity_enabled = (val != 0);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AFFINITY=%ld to affinity %s", val, g.cfg.affinity_enabled ? "enabled" : "disabled");
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_MAIN_CORE")) {
+
+		char* end = nullptr;
+		long val = std::strtol(v, &end, 10);
+
+		if (end == v || val < 0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_MAIN_CORE='%s' (must be >= 0), using compile-time default (%d)", v, MAL_MAIN_CORE_DEFAULT);
+
+		} else {
+
+			g.cfg.main_core = (int)val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_MAIN_CORE=%ld", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_WORKER_CORE")) {
+
+		char* end = nullptr;
+		long val = std::strtol(v, &end, 10);
+
+		if (end == v || val < 0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_WORKER_CORE='%s' (must be >= 0), using compile-time default (%d)", v, MAL_WORKER_CORE_DEFAULT);
+
+		} else {
+
+			g.cfg.worker_core = (int)val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_WORKER_CORE=%ld", val);
 
 		}
 
@@ -2846,6 +3217,12 @@ void mal_init() {
 	MPI_Comm_rank(g.comm.universe, &g.comm.u_rank);
 	MPI_Comm_size(g.comm.universe, &g.comm.u_size);
 
+	#if defined(__linux__) || defined(__APPLE__)
+
+		pin_main_thread_to_pcore();
+
+	#endif
+
 	if (MAL_INITIAL_SIZE <= 0 || MAL_INITIAL_SIZE > g.comm.u_size) {
 
 		if (g.comm.u_rank == 0) {
@@ -2860,6 +3237,12 @@ void mal_init() {
 	MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
 
 	g.worker = std::thread(progress_thread);
+
+	#if defined(__linux__) || defined(__APPLE__)
+
+		pin_worker_thread_to_ecore(g.worker);
+
+	#endif
 
 	if (g.comm.active != MPI_COMM_NULL) {
 
@@ -2901,7 +3284,16 @@ static void vec_scatter(MalVec& v, const void* root_data) {
 
 	}
 
-	int rc = (int)(v.local_n * (long)v.elem_size);
+	long rc_bytes = v.local_n * (long)v.elem_size;
+
+	if (MAL_UNLIKELY(rc_bytes > INT_MAX)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "SCATTER", "Local receive size overflow (%ld bytes) in vec_scatter", rc_bytes);
+		MPI_Abort(g.comm.universe, 1);
+
+	}
+
+	int rc = (int)rc_bytes;
 
 	MPI_Scatterv(root_data, g.comm.a_rank == 0 ? sc.data() : nullptr, g.comm.a_rank == 0 ? sd.data() : nullptr, MPI_BYTE, v.buf, rc, MPI_BYTE, 0, g.comm.active);
 
@@ -3325,7 +3717,18 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	if ((once_all || shared_active) && result_rank >= 0) {
 
-		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Shared vector policy ignores gather result_rank=%d", result_rank); once_all = false;
+		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "Shared vector policy ignores gather result_rank=%d", result_rank);
+
+		// result_buf may have already been allocated on this rank; release it if we own it
+		if (v->result_buf != nullptr && v->result_buf != orig) {
+
+			std::free(v->result_buf);
+
+		}
+
+		v->result_buf = nullptr;
+		v->gather_root = -1;
+		once_all = false;
 		result_rank = -1;
 
 	}

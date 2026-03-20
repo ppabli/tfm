@@ -26,6 +26,24 @@
 
 #endif
 
+#ifndef MAL_AFFINITY_ENABLED
+
+	#define MAL_AFFINITY_ENABLED 1
+
+#endif
+
+#ifndef MAL_MAIN_CORE_DEFAULT
+
+	#define MAL_MAIN_CORE_DEFAULT -1
+
+#endif
+
+#ifndef MAL_WORKER_CORE_DEFAULT
+
+	#define MAL_WORKER_CORE_DEFAULT -1
+
+#endif
+
 #define MAL_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define MAL_LIKELY(x) __builtin_expect(!!(x), 1)
 #define MAL_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -43,8 +61,8 @@ const char* mal_log_level_name(MalLogLevel level);
 const char* mal_log_level_color(MalLogLevel level);
 const char* mal_log_reset_color();
 
-#define MAL_LOG(level, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-6s][R%d] " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
-#define MAL_LOG_L(level, tag, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-5s][%-6s][R%d] " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), (tag), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+#define MAL_LOG(level, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-6s][R%d] | " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+#define MAL_LOG_L(level, tag, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-6s][%-6s][R%d] | " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), (tag), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
 
 struct MalVec;
 struct MalAcc;

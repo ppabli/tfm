@@ -46,22 +46,22 @@ $(BUILD_DIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 run_montecarlo: $(TARGET_MC)
-	$(MPIRUN) -n $(NP) ./$(TARGET_MC)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC)
 
 run_vector: $(TARGET_VEC)
-	$(MPIRUN) -n $(NP) ./$(TARGET_VEC)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC)
 
 run_vector_collapse: $(TARGET_VEC)
-	$(MPIRUN) -n $(NP) ./$(TARGET_VEC) collapse
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) collapse
 
 run_matmul: $(TARGET_MM)
-	$(MPIRUN) -n $(NP) ./$(TARGET_MM) mm
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MM) mm
 
 run_matvec: $(TARGET_MM)
-	$(MPIRUN) -n $(NP) ./$(TARGET_MM) mv
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MM) mv
 
 run_convolution: $(TARGET_CONV)
-	$(MPIRUN) -n $(NP) ./$(TARGET_CONV)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_CONV)
 
 re: clean all
 
