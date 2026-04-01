@@ -32,9 +32,10 @@ DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MM:.o=.d)
 
 all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MM)
 
-$(LIB_MAL): $(LIB_OBJS)
+$(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
-	$(AR) rcs $@ $^
+	$(RM) $@
+	$(AR) rcs $@ $(LIB_OBJS)
 
 $(TARGET_MC): $(LIB_MAL) $(OBJS_MC)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MC) $(LIB_MAL) $(LIBS)
