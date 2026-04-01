@@ -105,11 +105,11 @@ int main(int argc, char* argv[]) {
 
 		if (errors == 0) {
 
-			MAL_LOG(MAL_LOG_INFO, "[RESULT] All elements correct");
+			MAL_LOG(MAL_LOG_INFO, "[RESULT] vector OK");
 
 		} else {
 
-			MAL_LOG(MAL_LOG_ERROR, "[RESULT] Some elements WRONG");
+			MAL_LOG(MAL_LOG_ERROR, "[RESULT] vector WRONG");
 
 		}
 

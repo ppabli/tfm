@@ -44,7 +44,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 		double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(MAL_TOTAL_POINTS);
 
-		MAL_LOG(MAL_LOG_INFO, "[RESULT] total_points=%d  hits=%ld  pi~=%.6f  error=%.2e", MAL_TOTAL_POINTS, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
+		MAL_LOG(MAL_LOG_INFO, "[RESULT] montecarlo OK total_points=%d  hits=%ld  pi~=%.6f  error=%.2e", MAL_TOTAL_POINTS, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
 
 	}
 
