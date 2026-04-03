@@ -1,3 +1,8 @@
+#ifndef MALLEABLE_RESIZER_CPP_INCLUDED
+#define MALLEABLE_RESIZER_CPP_INCLUDED
+
+#include "malleable_types.cpp"
+
 class Resizer {
 
 	std::vector<std::pair<long,long>> remaining_;
@@ -86,7 +91,7 @@ void Resizer::collect_ranges() {
 
 		push(*g.loop->user_iter + 1, g.loop->end);
 
-		for (size_t ri = g.loop->plan_idx + 1; ri < g.loop->plan_ranges.size(); ++ri) {
+		for (size_t ri = g.loop->plan_idx + 1; ri < g.loop->plan_ranges.size(); ri++) {
 
 			push(g.loop->plan_ranges[ri].first, g.loop->plan_ranges[ri].second);
 
@@ -115,6 +120,7 @@ void Resizer::collect_ranges() {
 		return;
 
 	}
+
 	std::vector<long> flat(total > 0 ? total : 1);
 
 	MPI_Allgatherv(local.empty() ? nullptr : local.data(), my_count, MPI_LONG, flat.data(), flat_counts.data(), flat_displs.data(), MPI_LONG, g.comm.universe);
@@ -209,7 +215,7 @@ void Resizer::init_vec_meta(int nvecs, int n) {
 
 	vmeta_.resize(n);
 
-	for (int vi = 0; vi < nvecs; ++vi) {
+	for (int vi = 0; vi < nvecs; vi++) {
 
 		vmeta_[vi].esz = g.loop->vecs[vi]->elem_size;
 		vmeta_[vi].shared_active = (g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ACTIVE) ? 1 : 0;
@@ -238,7 +244,7 @@ std::vector<TransferPlanEntry> Resizer::build_transfer_plan(const std::vector<lo
 
 	while (oi < g.comm.u_size && rem_per_rank_[oi] == 0) {
 
-		++oi;
+		oi++;
 
 	}
 
@@ -256,11 +262,11 @@ std::vector<TransferPlanEntry> Resizer::build_transfer_plan(const std::vector<lo
 
 		if (ov_e <= nv_e) {
 
-			++oi;
+			oi++;
 
 			while (oi < g.comm.u_size && rem_per_rank_[oi] == 0) {
 
-				++oi;
+				oi++;
 
 			}
 
@@ -268,7 +274,7 @@ std::vector<TransferPlanEntry> Resizer::build_transfer_plan(const std::vector<lo
 
 		if (nv_e <= ov_e) {
 
-			++ni;
+			ni++;
 
 			if (ni < target_) {
 
@@ -295,7 +301,7 @@ void Resizer::init_vec_tasks(int n, int nvecs, bool was_active) {
 
 	}
 
-	for (int vi = 0; vi < n; ++vi) {
+	for (int vi = 0; vi < n; vi++) {
 
 			auto& t = vtasks_[vi];
 
@@ -378,7 +384,7 @@ void Resizer::reserve_receiver_buffers(int n, bool am_receiver, const std::vecto
 
 	}
 
-	for (int vi = 0; vi < n; ++vi) {
+	for (int vi = 0; vi < n; vi++) {
 
 		if (vmeta_[vi].shared_active || receiver_reuses(g.comm.u_rank, vi)) {
 
@@ -410,7 +416,7 @@ void Resizer::exchange_vec_data(int n, bool was_active, const std::vector<long>&
 
 	for (const auto& tr : plan) {
 
-		for (int vi = 0; vi < n; ++vi) {
+		for (int vi = 0; vi < n; vi++) {
 
 			if (vmeta_[vi].shared_active || receiver_reuses(tr.new_rank, vi)) {
 
@@ -539,7 +545,7 @@ void Resizer::redistribute_vecs() {
 
 	if (am_receiver && my_new_count_ > 0) {
 
-		for (int vi = 0; vi < n; ++vi) {
+		for (int vi = 0; vi < n; vi++) {
 
 			if (vmeta_[vi].shared_active || !vtasks_[vi].v) {
 
@@ -628,7 +634,7 @@ void Resizer::apply_active() {
 
 	if (g.loop && !waiting_for_activation) {
 
-		for (size_t ti = 0; ti < vtasks_.size(); ++ti) {
+		for (size_t ti = 0; ti < vtasks_.size(); ti++) {
 
 			auto& t = vtasks_[ti];
 
@@ -850,7 +856,7 @@ void Resizer::broadcast_shared_vecs() {
 
 		shared_meta.reserve(g.vecs.size());
 
-		for (int i = 0; i < (int)g.vecs.size(); ++i) {
+		for (int i = 0; i < (int)g.vecs.size(); i++) {
 
 			MalVec* v = g.vecs[i].get();
 
@@ -976,7 +982,7 @@ void Resizer::stash_gather_cache() {
 
 	}
 
-	for (size_t i = 0; i < vtasks_.size(); ++i) {
+	for (size_t i = 0; i < vtasks_.size(); i++) {
 
 			auto& t = vtasks_[i];
 			auto& c = g.gather_cache[i];
@@ -1103,6 +1109,221 @@ static ResizeDecision decide_resize_fixed_sequence(const ResizeDecisionContext& 
 
 }
 
+static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
+
+	ResizeDecision out;
+
+	if (!g.cfg.enabled.load(std::memory_order_relaxed)) {
+
+		return out;
+
+	}
+
+	long local_rem = 0;
+
+	if (g.loop && g.comm.active != MPI_COMM_NULL) {
+
+		long cur = *g.loop->user_iter;
+
+		if (cur + 1 < g.loop->end) {
+
+			local_rem += g.loop->end - (cur + 1);
+
+		}
+
+		for (size_t ri = g.loop->plan_idx + 1; ri < g.loop->plan_ranges.size(); ri++) {
+
+			local_rem += g.loop->plan_ranges[ri].second - g.loop->plan_ranges[ri].first;
+
+		}
+
+	}
+
+	double my_elapsed = MPI_Wtime() - g.lb.epoch_start_time;
+	long my_done = std::max(0L, g.lb.epoch_assigned - local_rem);
+	double my_thr = (my_elapsed > 1e-6 && my_done > 0) ? (double)my_done / my_elapsed : 0.0;
+
+	double send_sum[2] = {(double)local_rem, my_thr};
+	double recv_sum[2] = {0.0, 0.0};
+	MPI_Allreduce(send_sum, recv_sum, 2, MPI_DOUBLE, MPI_SUM, g.comm.universe);
+
+	const double global_remaining = recv_sum[0];
+	const double global_throughput_inst = recv_sum[1];
+
+	const double thr_ewma_alpha = std::clamp(g.cfg.auto_thr_ewma_alpha, 1e-6, 1.0);
+	double global_throughput = global_throughput_inst;
+
+	if (global_throughput_inst > 1e-12) {
+
+		if (g.lb.auto_thr_ewma <= 1e-12) {
+
+			g.lb.auto_thr_ewma = global_throughput_inst;
+
+		} else {
+
+			g.lb.auto_thr_ewma = thr_ewma_alpha * global_throughput_inst + (1.0 - thr_ewma_alpha) * g.lb.auto_thr_ewma;
+
+		}
+
+		global_throughput = g.lb.auto_thr_ewma;
+
+	}
+
+	double my_data_bytes = 0.0;
+
+	if (g.loop) {
+
+		for (MalVec* v : g.loop->vecs) {
+
+			if (v && v->attach_policy == MAL_ATTACH_PARTITIONED) {
+
+				my_data_bytes += (double)v->total_N * (double)v->elem_size;
+
+			}
+
+		}
+
+	}
+
+	double send_max[2] = {my_data_bytes, (double)g.comm.a_size};
+	double recv_max[2] = {0.0, 0.0};
+
+	MPI_Allreduce(send_max, recv_max, 2, MPI_DOUBLE, MPI_MAX, g.comm.universe);
+
+	const double max_data_bytes = recv_max[0];
+	const int N = (int)recv_max[1];
+
+	if (global_throughput < 1e-9 || global_remaining < 1.0 || N <= 0) {
+
+		if (global_remaining < 1.0 && global_throughput > 1e-9) {
+
+			g.sync.stop = true;
+			g.sync.notify();
+
+		}
+
+		return out;
+
+	}
+
+	const int U = ctx.universe_size;
+	const double bw = (g.lb.auto_bw_est_bps > 1e-12) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
+	const double epoch_secs = g.cfg.epoch_ms.load() / 1000.0;
+	const double T_current = global_remaining / global_throughput;
+
+	const double alpha_sync = std::max(0.0, g.lb.auto_alpha_est_sec);
+	const double base_sync = std::max(alpha_sync, epoch_secs * g.cfg.auto_sync_overhead_frac);
+
+	auto sync_cost_for = [&](int n) -> double {
+		return base_sync * std::log2(std::max(2.0, (double)n));
+	};
+
+	const auto& w = g.lb.weights;
+
+	const bool active_weights_ok = ((int)w.size() >= N);
+
+	double sum_w_active = active_weights_ok ? 0.0 : ((double)N / (double)U);
+	double w_min_active = active_weights_ok ? 1.0 : (1.0 / U);
+
+	if (active_weights_ok) {
+
+		for (int k = 0; k < N; k++) {
+
+			sum_w_active += w[k];
+			w_min_active = std::min(w_min_active, w[k]);
+
+		}
+
+	}
+
+	if ((double)N > global_remaining && N > 1) {
+
+		const int target = std::max(1, std::min(N - 1, (int)global_remaining));
+		const double sc = sync_cost_for(N);
+
+		const double resize_cost = (bw > 0.0 ? max_data_bytes * (double)(N - target) / ((double)N * bw) : 0.0) + sc;
+
+		if (T_current > resize_cost * 2.0) {
+
+			MAL_LOG_L(MAL_LOG_INFO, "AUTO", "Scale down (starvation): rem=%.0f < active=%d → target=%d (resize_cost=%.3fs T=%.3fs)", global_remaining, N, target, resize_cost, T_current);
+
+			out.should_resize = true;
+			out.target_active_size = target;
+			return out;
+
+		}
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale down skipped: rem=%.0f < active=%d but T=%.3fs < 2*cost=%.3fs", global_remaining, N, T_current, resize_cost * 2.0);
+
+	}
+
+	if (N >= U) {
+
+		return out;
+
+	}
+
+	double sum_w_cand = sum_w_active;
+	double w_min_cand = active_weights_ok ? w_min_active : (1.0 / U);
+	double sum_w_at_best = sum_w_active;
+	int candidate = -1;
+
+	for (int c = N + 1; c <= U; c++) {
+
+		const bool cand_w_ok = ((int)w.size() >= c);
+		const double w_new = (active_weights_ok && cand_w_ok) ? w[c - 1] : (1.0 / U);
+
+		sum_w_cand += w_new;
+		w_min_cand = std::min(w_min_cand, w_new);
+
+		const double sc_c = sync_cost_for(c);
+
+		if (sc_c > 1e-9) {
+
+			const double speedup_c = (sum_w_active > 1e-9) ? sum_w_cand / sum_w_active : (double)c / (double)N;
+			const double T_new_c = T_current / speedup_c;
+			const double min_t_rank = (sum_w_cand > 1e-9) ? T_new_c * w_min_cand / sum_w_cand : T_new_c / c;
+
+			if (min_t_rank < sc_c) {
+
+				break;
+
+			}
+
+		}
+
+		candidate = c;
+		sum_w_at_best = sum_w_cand;
+
+	}
+
+	if (candidate == -1) {
+
+		return out;
+
+	}
+
+	const double speedup = (active_weights_ok && sum_w_active > 1e-9 && sum_w_at_best > 1e-9) ? sum_w_at_best / sum_w_active : (double)candidate / (double)N;
+	const double T_new = T_current / speedup;
+
+	const int k_new = candidate - N;
+	const double data_moved = (bw > 0.0) ? max_data_bytes * (double)k_new / (double)candidate / bw : 0.0;
+	const double transfer_cost = data_moved + sync_cost_for(candidate);
+	const double net_gain = T_current - T_new - transfer_cost;
+
+	if (net_gain > 0.0) {
+
+		MAL_LOG_L(MAL_LOG_INFO, "AUTO", "Scale up: rem=%.0f T_curr=%.3fs T_new=%.3fs speedup=%.2fx gain=%.3fs cost=%.3fs → target=%d", global_remaining, T_current, T_new, speedup, net_gain, transfer_cost, candidate);
+
+		out.should_resize = true;
+		out.target_active_size = candidate;
+
+	}
+
+	return out;
+
+}
+
 static ResizeDecision decide_resize_hw_counters(const ResizeDecisionContext&) {
 
 	MAL_LOG_L(MAL_LOG_ERROR, "EPOCH", "MAL_RESIZE_POLICY_HW_COUNTERS is not implemented yet");
@@ -1124,6 +1345,14 @@ static ResizeDecision run_local_resize_decision(ResizeDecisionContext& ctx) {
 
 	switch (g.cfg.resize_policy) {
 
+		case MAL_RESIZE_POLICY_AUTO:
+			decision = decide_resize_auto(ctx);
+			break;
+
+		case MAL_RESIZE_POLICY_FIXED_SEQUENCE:
+			decision = decide_resize_fixed_sequence(ctx);
+			break;
+
 		case MAL_RESIZE_POLICY_HW_COUNTERS:
 			decision = decide_resize_hw_counters(ctx);
 			break;
@@ -1133,8 +1362,7 @@ static ResizeDecision run_local_resize_decision(ResizeDecisionContext& ctx) {
 			break;
 
 		default:
-			decision = decide_resize_fixed_sequence(ctx);
-			break;
+			decision = decide_resize_auto(ctx);
 
 	}
 
@@ -1166,12 +1394,6 @@ struct ResizeConsensus {
 	unsigned long long decision_epoch{0};
 
 };
-
-static bool current_policy_uses_sequence() {
-
-	return g.cfg.resize_policy == MAL_RESIZE_POLICY_AUTO || g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE;
-
-}
 
 static ResizeConsensus unanimous_resize_decision() {
 
@@ -1237,7 +1459,7 @@ static void advance_default_sequence_after_commit() {
 
 	if (seq_idx < g.cfg.sequence.size()) {
 
-		++seq_idx;
+		seq_idx++;
 		g.cfg.seq_idx.store(seq_idx, std::memory_order_relaxed);
 
 	}
@@ -1266,7 +1488,7 @@ static bool prepare_resize_if_needed() {
 
 	ResizeConsensus consensus = unanimous_resize_decision();
 
-	const bool seq_policy = current_policy_uses_sequence();
+	const bool seq_policy = (g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE);
 
 	if (seq_policy && !consensus.unanimous) {
 
@@ -1317,6 +1539,7 @@ static bool prepare_resize_if_needed() {
 
 		g.prepared_resize.target = consensus.target;
 		g.prepared_resize.decision_epoch = consensus.decision_epoch;
+
 		g.prepared_resize.work = std::move(prepared);
 
 	}
@@ -1397,17 +1620,79 @@ static bool commit_prepared_resize_if_ready() {
 
 	}
 
+	double my_data_bytes = 0.0;
+
+	if (g.loop) {
+
+		for (MalVec* v : g.loop->vecs) {
+
+			if (v && v->attach_policy == MAL_ATTACH_PARTITIONED) {
+
+				my_data_bytes += (double)v->total_N * (double)v->elem_size;
+
+			}
+
+		}
+
+	}
+
+	double max_data_bytes = 0.0;
+	MPI_Allreduce(&my_data_bytes, &max_data_bytes, 1, MPI_DOUBLE, MPI_MAX, g.comm.universe);
+
+	const int old_n = std::max(1, g.comm.a_size);
+	const int new_n = std::max(1, prep_target);
+	const int denom_n = std::max(old_n, new_n);
+	const double model_moved_bytes = max_data_bytes * (double)std::abs(new_n - old_n) / (double)denom_n;
+	const double model_logp = std::log2(std::max(2.0, (double)new_n));
+
 	g.sync.resize_pending = true;
 	g.sync.notify();
 
 	MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Committing resize target=%d", prep_target);
 
+	const double commit_t0 = MPI_Wtime();
 	prepared_work->commit_phase();
+	const double commit_elapsed_local = MPI_Wtime() - commit_t0;
+
+	double commit_elapsed = 0.0;
+	MPI_Allreduce(&commit_elapsed_local, &commit_elapsed, 1, MPI_DOUBLE, MPI_MAX, g.comm.universe);
+
+	if (model_logp > 1e-9) {
+
+		const double cal_alpha = std::clamp(g.cfg.auto_calibration_alpha, 1e-6, 1.0);
+		const double bw_ref = (g.lb.auto_bw_est_bps > 1e-12) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
+		const double data_term = (bw_ref > 1e-12) ? (model_moved_bytes / bw_ref) : 0.0;
+
+		double alpha_sample = (commit_elapsed - data_term) / model_logp;
+		if (!std::isfinite(alpha_sample) || alpha_sample < 0.0) {
+
+			alpha_sample = 0.0;
+
+		}
+
+		g.lb.auto_alpha_est_sec = cal_alpha * alpha_sample + (1.0 - cal_alpha) * g.lb.auto_alpha_est_sec;
+
+		if (model_moved_bytes > 1e-6 && commit_elapsed > 1e-9) {
+
+			double beta_sample = (commit_elapsed - g.lb.auto_alpha_est_sec * model_logp) / model_moved_bytes;
+
+			if (std::isfinite(beta_sample) && beta_sample > 0.0) {
+
+				const double bw_sample = 1.0 / beta_sample;
+				g.lb.auto_bw_est_bps = cal_alpha * bw_sample + (1.0 - cal_alpha) * g.lb.auto_bw_est_bps;
+
+			}
+
+		}
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Calibrated comm model: alpha=%.6fs bw=%.3e B/s (elapsed=%.4fs moved=%.3eB logp=%.3f)", g.lb.auto_alpha_est_sec, g.lb.auto_bw_est_bps, commit_elapsed, model_moved_bytes, model_logp);
+
+	}
 
 	g.sync.resize_pending = false;
 	clear_prepared_resize();
 
-	if (current_policy_uses_sequence()) {
+	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
 		advance_default_sequence_after_commit();
 
@@ -1508,4 +1793,6 @@ static void progress_thread() {
 	g.sync.notify();
 
 }
+
+#endif
 

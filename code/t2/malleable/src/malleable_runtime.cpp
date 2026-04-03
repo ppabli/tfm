@@ -1,3 +1,5 @@
+#include "malleable_resizer.cpp"
+
 void mal_set_epoch_interval_ms(int ms) {
 
 	if (ms > 0) {
@@ -54,7 +56,7 @@ static bool apply_resize_sequence(const std::vector<int>& seq, const char* sourc
 	g.cfg.sequence.clear();
 	g.cfg.sequence.reserve(seq.size());
 
-	for (size_t i = 0; i < seq.size(); ++i) {
+	for (size_t i = 0; i < seq.size(); i++) {
 
 		const int target = seq[i];
 
@@ -120,19 +122,13 @@ static bool parse_resize_sequence(const char* text, std::vector<int>& seq_out, b
 
 		while (*p == ',' || *p == ' ') {
 
-			++p;
+			p++;
 
 		}
 
 	}
 
 	return !seq_out.empty();
-
-}
-
-static bool policy_uses_resize_sequence(MalResizePolicy policy) {
-
-	return policy == MAL_RESIZE_POLICY_AUTO || policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE;
 
 }
 
@@ -190,7 +186,7 @@ static void load_resize_sequence_or_abort() {
 
 static void validate_resize_sequence_against_universe_or_abort() {
 
-	for (size_t i = 0; i < g.cfg.sequence.size(); ++i) {
+	for (size_t i = 0; i < g.cfg.sequence.size(); i++) {
 
 		const int target = g.cfg.sequence[i];
 
@@ -207,7 +203,7 @@ static void validate_resize_sequence_against_universe_or_abort() {
 
 static void load_env_config() {
 
-	if (policy_uses_resize_sequence(g.cfg.resize_policy)) {
+	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
 		load_resize_sequence_or_abort();
 
@@ -310,6 +306,78 @@ static void load_env_config() {
 
 	}
 
+	if (const char* v = std::getenv("MAL_AUTO_BANDWIDTH_BPS")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val <= 0.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_BANDWIDTH_BPS='%s' (must be > 0)", v);
+
+		} else {
+
+			g.cfg.auto_bandwidth_bps = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_BANDWIDTH_BPS=%.3e", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_SYNC_OVERHEAD_FRAC")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val < 0.0 || val >= 1.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_SYNC_OVERHEAD_FRAC='%s' (must be in [0, 1))", v);
+
+		} else {
+
+			g.cfg.auto_sync_overhead_frac = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_SYNC_OVERHEAD_FRAC=%.4f", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_THR_EWMA_ALPHA")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val <= 0.0 || val > 1.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_THR_EWMA_ALPHA='%s' (must be in (0, 1])", v);
+
+		} else {
+
+			g.cfg.auto_thr_ewma_alpha = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_THR_EWMA_ALPHA=%.4f", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_CALIBRATION_ALPHA")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val <= 0.0 || val > 1.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_CALIBRATION_ALPHA='%s' (must be in (0, 1])", v);
+
+		} else {
+
+			g.cfg.auto_calibration_alpha = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_CALIBRATION_ALPHA=%.4f", val);
+
+		}
+
+	}
+
 }
 
 void mal_init(MalResizePolicy policy) {
@@ -317,6 +385,7 @@ void mal_init(MalResizePolicy policy) {
 	g.cfg.resize_policy = policy;
 
 	load_env_config();
+	g.lb.auto_bw_est_bps = g.cfg.auto_bandwidth_bps;
 
 	MPI_Session_init(MPI_INFO_NULL, MPI_ERRORS_RETURN, &g.comm.session);
 	MPI_Group_from_session_pset(g.comm.session, "mpi://WORLD", &g.comm.world_group);
@@ -324,7 +393,7 @@ void mal_init(MalResizePolicy policy) {
 	MPI_Comm_rank(g.comm.universe, &g.comm.u_rank);
 	MPI_Comm_size(g.comm.universe, &g.comm.u_size);
 
-	if (policy_uses_resize_sequence(policy)) {
+	if (policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
 		validate_resize_sequence_against_universe_or_abort();
 
@@ -385,7 +454,7 @@ static void vec_scatter(MalVec& v, const void* root_data) {
 
 		sc.resize(g.comm.a_size);
 
-		for (int k = 0; k < g.comm.a_size; ++k) {
+		for (int k = 0; k < g.comm.a_size; k++) {
 
 			long ks, ke;
 			distribute(v.total_N, g.comm.a_size, k, ks, ke);
@@ -481,11 +550,11 @@ static void vec_gather(MalVec& v) {
 
 		data_counts.resize(usiz);
 
-		for (int k = 0; k < usiz; ++k) {
+		for (int k = 0; k < usiz; k++) {
 
 			long total = 0;
 
-			for (int s = 0; s < seg_counts[k] / 2; ++s) {
+			for (int s = 0; s < seg_counts[k] / 2; s++) {
 
 				total += all_segs[seg_displs[k] + s * 2 + 1];
 
@@ -509,9 +578,9 @@ static void vec_gather(MalVec& v) {
 		char* recv_buf = static_cast<char*>(recv_raw);
 		long data_off = 0;
 
-		for (int k = 0; k < usiz; ++k) {
+		for (int k = 0; k < usiz; k++) {
 
-			for (int s = 0; s < seg_counts[k] / 2; ++s) {
+			for (int s = 0; s < seg_counts[k] / 2; s++) {
 
 				long gs = all_segs[seg_displs[k] + s * 2];
 				long cnt = all_segs[seg_displs[k] + s * 2 + 1];
@@ -714,7 +783,7 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 static void advance_next_range(MalFor& f) {
 
-	++f.plan_idx;
+	f.plan_idx++;
 	auto [a, b] = f.plan_ranges[f.plan_idx];
 
 	f.start = a;
@@ -761,7 +830,6 @@ void mal_check_for(MalFor& f) {
 
 		});
 
-		// Load pending ranges for newly active ranks
 		if (g.comm.active != MPI_COMM_NULL && f.start == f.end && g.pending && !g.pending->ranges.empty()) {
 
 			load_pending_ranges_into_loop(f);

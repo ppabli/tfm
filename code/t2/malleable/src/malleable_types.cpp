@@ -1,3 +1,6 @@
+#ifndef MALLEABLE_TYPES_CPP_INCLUDED
+#define MALLEABLE_TYPES_CPP_INCLUDED
+
 #include "malleable.hpp"
 
 #include <algorithm>
@@ -100,7 +103,7 @@ class BufferPool {
 
 			for (auto& [key, tb] : map) {
 
-				for (int i = 0; i < tb.count; ++i) {
+				for (int i = 0; i < tb.count; i++) {
 
 					if (tb.slots[i].ptr) {
 
@@ -368,6 +371,11 @@ struct MalState {
 		std::atomic<bool> enabled{true};
 		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
 
+		double auto_bandwidth_bps{MAL_AUTO_BANDWIDTH_BPS};
+		double auto_sync_overhead_frac{MAL_AUTO_SYNC_OVERHEAD_FRAC};
+		double auto_thr_ewma_alpha{MAL_AUTO_THR_EWMA_ALPHA};
+		double auto_calibration_alpha{MAL_AUTO_CALIBRATION_ALPHA};
+
 		bool affinity_enabled{MAL_AFFINITY_ENABLED != 0};
 		int main_core{MAL_MAIN_CORE_DEFAULT};
 		int worker_core{MAL_WORKER_CORE_DEFAULT};
@@ -458,6 +466,9 @@ struct MalState {
 		double epoch_start_time{0.0};
 		long epoch_assigned{0};
 		double alpha{0.3};
+		double auto_thr_ewma{0.0};
+		double auto_bw_est_bps{MAL_AUTO_BANDWIDTH_BPS};
+		double auto_alpha_est_sec{0.0};
 
 	} lb;
 
@@ -662,7 +673,7 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 		auto& idx = want_pcore ? p_idx : e_idx;
 
-		for (size_t i = 0; i < pool.size(); ++i) {
+		for (size_t i = 0; i < pool.size(); i++) {
 
 			int core = pool[(idx++) % pool.size()];
 
@@ -891,7 +902,7 @@ static MPI_Datatype tag_dtype(int t) noexcept {
 
 static int dtype_tag(MPI_Datatype d) noexcept {
 
-	for (int i = 0; i < (int)std::size(kDtypeTbl); ++i) {
+	for (int i = 0; i < (int)std::size(kDtypeTbl); i++) {
 
 		if (kDtypeTbl[i] == d) {
 
@@ -907,7 +918,7 @@ static int dtype_tag(MPI_Datatype d) noexcept {
 
 static int dop_tag(MPI_Op d) noexcept {
 
-	for (int i = 0; i < (int)std::size(kDopTbl); ++i) {
+	for (int i = 0; i < (int)std::size(kDopTbl); i++) {
 
 		if (kDopTbl[i] == d) {
 
@@ -1534,7 +1545,7 @@ static StagedBuffer take_pending_shared_mat() {
 
 	StagedBuffer buf = g.pending->shared_mats[g.pending->next_shared];
 	g.pending->shared_mats[g.pending->next_shared] = {};
-	++g.pending->next_shared;
+	g.pending->next_shared++;
 	return buf;
 
 }
@@ -1746,7 +1757,7 @@ static void append_done_segments(MalVec& v, const MalFor& f, long local_origin, 
 
 	v.done_segs.reserve(v.done_segs.size() + f.plan_ranges.size());
 
-	for (size_t ri = 0; ri < f.plan_ranges.size(); ++ri) {
+	for (size_t ri = 0; ri < f.plan_ranges.size(); ri++) {
 
 		const auto [gs, ge] = f.plan_ranges[ri];
 		const long base = local_origin + f.plan_local_bases[ri];
@@ -1806,7 +1817,7 @@ static std::vector<long> build_partition_cuts(long total, int nprocs) {
 
 	if (sum_w <= 0.0) {
 
-		for (int r = 0; r < nprocs; ++r) {
+		for (int r = 0; r < nprocs; r++) {
 
 			distribute(total, nprocs, r, cuts[(size_t)r], cuts[(size_t)r + 1]);
 
@@ -1818,7 +1829,7 @@ static std::vector<long> build_partition_cuts(long total, int nprocs) {
 
 	double prefix = 0.0;
 
-	for (int r = 0; r < nprocs; ++r) {
+	for (int r = 0; r < nprocs; r++) {
 
 		cuts[(size_t)r] = std::clamp((long)std::llround((prefix / sum_w) * (double)total), 0L, total);
 		prefix += w[r];
@@ -1873,7 +1884,7 @@ MalCollapseSpec mal_make_collapse_spec(const long* extents, size_t ndims) {
 
 	long total = 1;
 
-	for (size_t i = 0; i < ndims; ++i) {
+	for (size_t i = 0; i < ndims; i++) {
 
 		if (spec.extents[i] < 0) {
 
@@ -1935,7 +1946,7 @@ void mal_collapse_decode(const MalCollapseSpec& spec, long flat_iter, long* indi
 
 	if (flat_iter < 0) {
 
-		for (size_t i = 0; i < spec.extents.size(); ++i) {
+		for (size_t i = 0; i < spec.extents.size(); i++) {
 
 			indices_out[i] = 0;
 
@@ -1945,7 +1956,7 @@ void mal_collapse_decode(const MalCollapseSpec& spec, long flat_iter, long* indi
 
 	}
 
-	for (size_t i = 0; i < spec.extents.size(); ++i) {
+	for (size_t i = 0; i < spec.extents.size(); i++) {
 
 		long extent = spec.extents[i];
 		long stride = spec.strides[i];
@@ -1980,7 +1991,7 @@ MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* lim
 
 	std::vector<long> extents(ndims, 0);
 
-	for (size_t d = 0; d < ndims; ++d) {
+	for (size_t d = 0; d < ndims; d++) {
 
 		extents[d] = limits[d] - starts[d];
 
@@ -2002,7 +2013,7 @@ MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* lim
 
 		mal_collapse_decode(out.spec, out.flat, out.decoded_idx.data());
 
-		for (size_t d = 0; d < ndims; ++d) {
+		for (size_t d = 0; d < ndims; d++) {
 
 			if (out.iter_vars[d]) {
 
@@ -2024,7 +2035,7 @@ MalForND mal_for_nd_begin(long* const* iter_vars, long* const* limit_vars, const
 
 	out.limit_vars.assign(limit_vars, limit_vars + ndims);
 
-	for (size_t d = 0; d < ndims && d < out.limit_vars.size(); ++d) {
+	for (size_t d = 0; d < ndims && d < out.limit_vars.size(); d++) {
 
 		if (out.limit_vars[d]) {
 
@@ -2046,7 +2057,7 @@ bool mal_for_nd_done(const MalForND& f) {
 
 static void mal_for_nd_sync_limits(MalForND& f) {
 
-	for (size_t d = 0; d < f.limit_vars.size() && d < f.limits.size(); ++d) {
+	for (size_t d = 0; d < f.limit_vars.size() && d < f.limits.size(); d++) {
 
 		if (f.limit_vars[d]) {
 
@@ -2076,7 +2087,7 @@ static void mal_for_nd_set_iters_from_flat(MalForND& f, long flat_iter, bool for
 
 	const size_t ndims = f.decoded_idx.size();
 
-	for (size_t d = 0; d < ndims && d < f.iter_vars.size() && d < f.starts.size(); ++d) {
+	for (size_t d = 0; d < ndims && d < f.iter_vars.size() && d < f.starts.size(); d++) {
 
 		if (!f.iter_vars[d]) {
 
@@ -2104,7 +2115,7 @@ static void mal_for_nd_mark_done(MalForND& f) {
 
 	mal_for_nd_sync_limits(f);
 
-	for (size_t d = 0; d < f.iter_vars.size() && d < f.limits.size(); ++d) {
+	for (size_t d = 0; d < f.iter_vars.size() && d < f.limits.size(); d++) {
 
 		if (f.iter_vars[d]) {
 
@@ -2212,7 +2223,7 @@ slice_remaining(const std::vector<std::pair<long,long>>& remaining,
 	size_t idx = (size_t)std::distance(offsets.begin(), std::upper_bound(offsets.begin(), offsets.end(), vstart)) - 1;
 	long offset = offsets[idx];
 
-	for (; idx < remaining.size(); ++idx) {
+	for (; idx < remaining.size(); idx++) {
 
 		auto [a, b] = remaining[idx];
 
@@ -2335,4 +2346,6 @@ static bool vec_reuse_local_copy(MalVec& v, const std::vector<std::pair<long,lon
 	return true;
 
 }
+
+#endif
 

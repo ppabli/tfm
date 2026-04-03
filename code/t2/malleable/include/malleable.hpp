@@ -51,6 +51,30 @@
 
 #endif
 
+#ifndef MAL_AUTO_BANDWIDTH_BPS
+
+	#define MAL_AUTO_BANDWIDTH_BPS 1e9
+
+#endif
+
+#ifndef MAL_AUTO_SYNC_OVERHEAD_FRAC
+
+	#define MAL_AUTO_SYNC_OVERHEAD_FRAC 0.05
+
+#endif
+
+#ifndef MAL_AUTO_THR_EWMA_ALPHA
+
+	#define MAL_AUTO_THR_EWMA_ALPHA 0.25
+
+#endif
+
+#ifndef MAL_AUTO_CALIBRATION_ALPHA
+
+	#define MAL_AUTO_CALIBRATION_ALPHA 0.20
+
+#endif
+
 #define MAL_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define MAL_LIKELY(x) __builtin_expect(!!(x), 1)
 #define MAL_UNLIKELY(x) __builtin_expect(!!(x), 0)
