@@ -3,6 +3,11 @@
 
 #include "malleable_types.cpp"
 
+static constexpr double kEpsElapsed = 1e-6;
+static constexpr double kEpsThroughput = 1e-9;
+static constexpr double kEpsWeight = 1e-12;
+static constexpr double kEpsDone = 1.0;
+
 class Resizer {
 
 	std::vector<std::pair<long,long>> remaining_;
@@ -27,6 +32,11 @@ class Resizer {
 	std::vector<std::pair<long,long>> scratch_assigned_;
 	std::vector<int> scratch_reuse_flags_;
 	std::vector<int> scratch_all_reuse_flags_;
+
+	std::vector<long> flat_buf_;
+	std::vector<int> flat_counts_buf_;
+	std::vector<int> flat_displs_buf_;
+	std::vector<double> all_lb_buf_;
 
 	void init_vec_meta(int nvecs, int n);
 	std::vector<TransferPlanEntry> build_transfer_plan(const std::vector<long>& old_vs) const;
@@ -101,13 +111,13 @@ void Resizer::collect_ranges() {
 
 	int my_count = (int)local.size();
 
-	std::vector<int> flat_counts(g.comm.u_size);
+	flat_counts_buf_.resize(g.comm.u_size);
 
-	MPI_Allgather(&my_count, 1, MPI_INT, flat_counts.data(), 1, MPI_INT, g.comm.universe);
+	MPI_Allgather(&my_count, 1, MPI_INT, flat_counts_buf_.data(), 1, MPI_INT, g.comm.universe);
 
-	std::vector<int> flat_displs = make_displs(flat_counts);
+	flat_displs_buf_ = make_displs(flat_counts_buf_);
 
-	int total = flat_displs.back() + flat_counts.back();
+	int total = flat_displs_buf_.back() + flat_counts_buf_.back();
 
 	if (total == 0) {
 
@@ -121,9 +131,9 @@ void Resizer::collect_ranges() {
 
 	}
 
-	std::vector<long> flat(total > 0 ? total : 1);
+	flat_buf_.resize(total > 0 ? (size_t)total : 1);
 
-	MPI_Allgatherv(local.empty() ? nullptr : local.data(), my_count, MPI_LONG, flat.data(), flat_counts.data(), flat_displs.data(), MPI_LONG, g.comm.universe);
+	MPI_Allgatherv(local.empty() ? nullptr : local.data(), my_count, MPI_LONG, flat_buf_.data(), flat_counts_buf_.data(), flat_displs_buf_.data(), MPI_LONG, g.comm.universe);
 
 	remaining_.clear();
 	remaining_.reserve(total / 2 + 1);
@@ -136,13 +146,13 @@ void Resizer::collect_ranges() {
 
 	for (int k = 0; k < g.comm.u_size; k++) {
 
-		int disp = flat_displs[k];
-		int nranges = flat_counts[k] / 2;
+		int disp = flat_displs_buf_[k];
+		int nranges = flat_counts_buf_[k] / 2;
 
 		for (int p = 0; p < nranges; p++) {
 
-			long s = flat[disp + p * 2];
-			long e = flat[disp + p * 2 + 1];
+			long s = flat_buf_[disp + p * 2];
+			long e = flat_buf_[disp + p * 2 + 1];
 			long len = e - s;
 
 			remaining_.push_back({s, e});
@@ -164,19 +174,19 @@ void Resizer::collect_ranges() {
 	long my_done = std::max(0L, g.lb.epoch_assigned - rem_per_rank_[g.comm.u_rank]);
 
 	double lbdata[2] = {(double)my_done, my_elapsed};
-	std::vector<double> all_lb((size_t)g.comm.u_size * 2);
+	all_lb_buf_.resize((size_t)g.comm.u_size * 2);
 
-	MPI_Allgather(lbdata, 2, MPI_DOUBLE, all_lb.data(), 2, MPI_DOUBLE, g.comm.universe);
+	MPI_Allgather(lbdata, 2, MPI_DOUBLE, all_lb_buf_.data(), 2, MPI_DOUBLE, g.comm.universe);
 
 	double total_tp = 0.0;
 	std::vector<double> tp(g.comm.u_size, 0.0);
 
 	for (int k = 0; k < g.comm.u_size; k++) {
 
-		long done = (long)all_lb[(size_t)k * 2];
-		double elapsed = all_lb[(size_t)k * 2 + 1];
+		long done = (long)all_lb_buf_[(size_t)k * 2];
+		double elapsed = all_lb_buf_[(size_t)k * 2 + 1];
 
-		if (done > 0 && elapsed > 1e-6) {
+		if (done > 0 && elapsed > kEpsElapsed) {
 
 			tp[k] = (double)done / elapsed;
 			total_tp += tp[k];
@@ -205,7 +215,7 @@ void Resizer::collect_ranges() {
 
 		}
 
-		MAL_LOG(MAL_LOG_INFO, "LB: epoch done=%ld elapsed=%.3fs thr=%.1f iters/s weight=%.4f", my_done, my_elapsed, my_done > 0 && my_elapsed > 1e-6 ? (double)my_done / my_elapsed : 0.0, g.comm.u_rank < (int)g.lb.weights.size() ? g.lb.weights[g.comm.u_rank] : 0.0);
+		MAL_LOG(MAL_LOG_DEBUG, "LB: epoch done=%ld elapsed=%.3fs thr=%.1f iters/s weight=%.4f", my_done, my_elapsed, my_done > 0 && my_elapsed > kEpsElapsed ? (double)my_done / my_elapsed : 0.0, g.comm.u_rank < (int)g.lb.weights.size() ? g.lb.weights[g.comm.u_rank] : 0.0);
 
 	}
 
@@ -623,11 +633,11 @@ void Resizer::apply_active() {
 
 	long new_asgn = vend - vstart;
 
-	const bool waiting_for_activation = g.loop && g.loop->phase.load(std::memory_order_relaxed) == MAL_LOOP_WAITING_ACTIVATION;
+	const bool waiting_for_activation = g.loop && g.loop->phase.load(std::memory_order_acquire) == MAL_LOOP_WAITING_ACTIVATION;
 	bool publish_pending_after_broadcast = false;
 	std::vector<std::pair<long,long>> deferred_pending_ranges;
 
-	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "a_rank=%d assigned %zu range(s) (%ld iters, weight=%.4f)", g.comm.a_rank, assigned.size(), new_asgn, g.comm.a_rank < (int)g.lb.weights.size() ? g.lb.weights[g.comm.a_rank] : 1.0 / g.comm.a_size);
+	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "a_rank=%d assigned %zu range(s) (%ld iters, weight=%.4f)", g.comm.a_rank, assigned.size(), new_asgn, g.comm.a_rank < (int)g.lb.weights.size() ? g.lb.weights[g.comm.a_rank] : 1.0 / g.comm.a_size);
 
 	g.lb.epoch_assigned = new_asgn;
 	g.lb.epoch_start_time = MPI_Wtime();
@@ -705,6 +715,7 @@ void Resizer::apply_active() {
 			install_loop_plan(*g.loop, assigned);
 			set_limit(*g.loop, g.loop->end);
 			set_iter (*g.loop, g.loop->start);
+			g.sync.loop_has_new_work.store(true, std::memory_order_release);
 
 		} else {
 
@@ -1002,14 +1013,8 @@ void Resizer::stash_gather_cache() {
 
 void Resizer::prepare_phase() {
 
-	if (target_ == g.comm.a_size) {
-
-		return;
-
-	}
-
 	const double t0 = MPI_Wtime();
-	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "Prepare phase start target=%d (active=%d)", target_, g.comm.a_size);
+	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Prepare phase start target=%d (active=%d)", target_, g.comm.a_size);
 
 	old_a_size_ = g.comm.a_size;
 
@@ -1017,39 +1022,37 @@ void Resizer::prepare_phase() {
 	redistribute_vecs();
 	reduce_accs();
 
-	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "Prepare phase done target=%d in %.4f s", target_, MPI_Wtime() - t0);
+	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Prepare phase done target=%d in %.4f s", target_, MPI_Wtime() - t0);
 
 }
 
 void Resizer::commit_phase() {
 
-	if (target_ == g.comm.a_size) {
-
-		return;
-
-	}
-
 	g.sync.wait_for_compute();
 
-	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "Commit phase start target=%d (current=%d)", target_, g.comm.a_size);
+	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Commit phase start target=%d (current=%d)", target_, g.comm.a_size);
 
 	double t0 = MPI_Wtime();
+	const bool same_size_rebalance = (target_ == g.comm.a_size);
 
-	if (g.comm.active != MPI_COMM_NULL) {
+	if (!same_size_rebalance) {
 
-		MPI_Comm_free(&g.comm.active);
-		g.comm.active = MPI_COMM_NULL;
+		if (g.comm.active != MPI_COMM_NULL) {
+
+			MPI_Comm_free(&g.comm.active);
+			g.comm.active = MPI_COMM_NULL;
+
+		}
+
+		int color = (g.comm.u_rank < target_) ? 0 : MPI_UNDEFINED;
+		MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
 
 	}
-
-	int color = (g.comm.u_rank < target_) ? 0 : MPI_UNDEFINED;
-	MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
 
 	if (g.comm.active != MPI_COMM_NULL) {
 
 		MPI_Comm_rank(g.comm.active, &g.comm.a_rank);
 		MPI_Comm_size(g.comm.active, &g.comm.a_size);
-
 		apply_active();
 
 	} else {
@@ -1060,7 +1063,17 @@ void Resizer::commit_phase() {
 
 	stash_gather_cache();
 
-	MAL_LOG_L(MAL_LOG_INFO, "RESIZE", "Resize to %d done in %.4f s", target_, MPI_Wtime() - t0);
+	if (same_size_rebalance) {
+
+		g.lb.auto_same_size_cooldown = std::max(0, g.cfg.auto_rebalance_cooldown_epochs);
+		g.lb.auto_same_size_streak = 0;
+		MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Rebalance on %d active ranks done in %.4f s", target_, MPI_Wtime() - t0);
+
+	} else {
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Resize to %d done in %.4f s", target_, MPI_Wtime() - t0);
+
+	}
 
 }
 
@@ -1070,7 +1083,7 @@ static ResizeDecisionContext make_resize_decision_context() {
 
 	ctx.universe_size = g.comm.u_size;
 	ctx.active_size = g.comm.a_size;
-	ctx.compute_epoch = g.sync.compute_epoch.load(std::memory_order_relaxed);
+	ctx.compute_epoch = g.sync.compute_epoch.load(std::memory_order_acquire);
 
  	return ctx;
 
@@ -1109,6 +1122,90 @@ static ResizeDecision decide_resize_fixed_sequence(const ResizeDecisionContext& 
 
 }
 
+static bool maybe_rebalance_same_size( const char* reason, ResizeDecision& out, int active_n, double global_remaining, long local_rem, double global_throughput, double sync_cost, double max_data_bytes, double bw, bool active_weights_ok, double sum_w_active, const std::vector<double>& weights) {
+
+	if (active_n <= 1 || global_remaining < (double)(active_n * std::max(1L, g.cfg.auto_rebalance_min_remaining_per_rank))) {
+
+		return false;
+
+	}
+
+	if (g.lb.auto_same_size_cooldown > 0) {
+
+		g.lb.auto_same_size_cooldown--;
+		g.lb.auto_same_size_streak = 0;
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Rebalance same-size skipped (%s): cooldown=%d", reason, g.lb.auto_same_size_cooldown);
+
+		return false;
+
+	}
+
+	std::vector<long> all_local_rem((size_t)g.comm.u_size, 0);
+	MPI_Allgather(&local_rem, 1, MPI_LONG, all_local_rem.data(), 1, MPI_LONG, g.comm.universe);
+
+	long rem_min = all_local_rem[0];
+	long rem_max = all_local_rem[0];
+	double T_now = 0.0;
+	double T_bal = 0.0;
+	double moved_iters_l1 = 0.0;
+
+	for (int k = 0; k < active_n; k++) {
+
+		const long rk = all_local_rem[(size_t)k];
+		rem_min = std::min(rem_min, rk);
+		rem_max = std::max(rem_max, rk);
+
+		const double share = (active_weights_ok && sum_w_active > kEpsThroughput) ? (weights[(size_t)k] / sum_w_active) : (1.0 / (double)active_n);
+
+		const double speed = std::max(kEpsWeight, global_throughput * share);
+		const double expected = global_remaining * share;
+
+		T_now = std::max(T_now, (double)rk / speed);
+		T_bal = std::max(T_bal, expected / speed);
+		moved_iters_l1 += std::fabs((double)rk - expected);
+
+	}
+
+	const double moved_iters = 0.5 * moved_iters_l1;
+	const double moved_bytes = (global_remaining > kEpsThroughput) ? (max_data_bytes * moved_iters / global_remaining) : 0.0;
+	const double migration_cost = (bw > 0.0) ? (moved_bytes / bw) : 0.0;
+	const double cost_total = sync_cost + migration_cost;
+
+	const double gross_gain = T_now - T_bal;
+	const double net_gain = gross_gain - cost_total;
+	const double rel_gain = (T_now > kEpsThroughput) ? (net_gain / T_now) : 0.0;
+
+	const bool worthwhile = (net_gain > 0.0) &&
+		(rel_gain >= g.cfg.auto_rebalance_min_rel_gain) &&
+		(T_now > cost_total * g.cfg.auto_rebalance_gain_margin);
+
+	if (!worthwhile) {
+
+		g.lb.auto_same_size_streak = 0;
+		return false;
+
+	}
+
+	g.lb.auto_same_size_streak++;
+
+	if (g.lb.auto_same_size_streak < std::max(1, g.cfg.auto_rebalance_min_streak)) {
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Rebalance same-size pending (%s): streak=%d/%d rem=[%ld..%ld] T_now=%.3fs T_bal=%.3fs cost=%.3fs net=%.3fs rel=%.2f%%", reason, g.lb.auto_same_size_streak, std::max(1, g.cfg.auto_rebalance_min_streak), rem_min, rem_max, T_now, T_bal, cost_total, net_gain, rel_gain * 100.0);
+		return false;
+
+	}
+
+	g.lb.auto_same_size_streak = 0;
+	out.should_resize = true;
+	out.target_active_size = active_n;
+
+	MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Rebalance same-size (%s): active=%d rem=[%ld..%ld] T_now=%.3fs T_bal=%.3fs sync=%.3fs mig=%.3fs net=%.3fs rel=%.2f%%", reason, active_n, rem_min, rem_max, T_now, T_bal, sync_cost, migration_cost, net_gain, rel_gain * 100.0);
+
+	return true;
+
+}
+
 static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 	ResizeDecision out;
@@ -1141,7 +1238,7 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 	double my_elapsed = MPI_Wtime() - g.lb.epoch_start_time;
 	long my_done = std::max(0L, g.lb.epoch_assigned - local_rem);
-	double my_thr = (my_elapsed > 1e-6 && my_done > 0) ? (double)my_done / my_elapsed : 0.0;
+	double my_thr = (my_elapsed > kEpsElapsed && my_done > 0) ? (double)my_done / my_elapsed : 0.0;
 
 	double send_sum[2] = {(double)local_rem, my_thr};
 	double recv_sum[2] = {0.0, 0.0};
@@ -1150,12 +1247,12 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 	const double global_remaining = recv_sum[0];
 	const double global_throughput_inst = recv_sum[1];
 
-	const double thr_ewma_alpha = std::clamp(g.cfg.auto_thr_ewma_alpha, 1e-6, 1.0);
+	const double thr_ewma_alpha = std::clamp(g.cfg.auto_thr_ewma_alpha, kEpsElapsed, 1.0);
 	double global_throughput = global_throughput_inst;
 
-	if (global_throughput_inst > 1e-12) {
+	if (global_throughput_inst > kEpsWeight) {
 
-		if (g.lb.auto_thr_ewma <= 1e-12) {
+		if (g.lb.auto_thr_ewma <= kEpsWeight) {
 
 			g.lb.auto_thr_ewma = global_throughput_inst;
 
@@ -1193,9 +1290,9 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 	const double max_data_bytes = recv_max[0];
 	const int N = (int)recv_max[1];
 
-	if (global_throughput < 1e-9 || global_remaining < 1.0 || N <= 0) {
+	if (global_throughput < kEpsThroughput || global_remaining < kEpsDone || N <= 0) {
 
-		if (global_remaining < 1.0 && global_throughput > 1e-9) {
+		if (global_remaining < kEpsDone && global_throughput > kEpsThroughput) {
 
 			g.sync.stop = true;
 			g.sync.notify();
@@ -1207,7 +1304,7 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 	}
 
 	const int U = ctx.universe_size;
-	const double bw = (g.lb.auto_bw_est_bps > 1e-12) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
+	const double bw = (g.lb.auto_bw_est_bps > kEpsWeight) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
 	const double epoch_secs = g.cfg.epoch_ms.load() / 1000.0;
 	const double T_current = global_remaining / global_throughput;
 
@@ -1235,6 +1332,7 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 		}
 
 	}
+	const double rebalance_cost = sync_cost_for(N);
 
 	if ((double)N > global_remaining && N > 1) {
 
@@ -1245,7 +1343,7 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 		if (T_current > resize_cost * 2.0) {
 
-			MAL_LOG_L(MAL_LOG_INFO, "AUTO", "Scale down (starvation): rem=%.0f < active=%d → target=%d (resize_cost=%.3fs T=%.3fs)", global_remaining, N, target, resize_cost, T_current);
+			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale down (starvation): rem=%.0f < active=%d → target=%d (resize_cost=%.3fs T=%.3fs)", global_remaining, N, target, resize_cost, T_current);
 
 			out.should_resize = true;
 			out.target_active_size = target;
@@ -1258,6 +1356,9 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 	}
 
 	if (N >= U) {
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale up skipped: active=%d is already at max universe=%d (rem=%.0f T=%.3fs)", N, U, global_remaining, T_current);
+		maybe_rebalance_same_size("at-max", out, N, global_remaining, local_rem, global_throughput, rebalance_cost, max_data_bytes, bw, active_weights_ok, sum_w_active, w);
 
 		return out;
 
@@ -1278,11 +1379,11 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 		const double sc_c = sync_cost_for(c);
 
-		if (sc_c > 1e-9) {
+		if (sc_c > kEpsThroughput) {
 
-			const double speedup_c = (sum_w_active > 1e-9) ? sum_w_cand / sum_w_active : (double)c / (double)N;
+			const double speedup_c = (sum_w_active > kEpsThroughput) ? sum_w_cand / sum_w_active : (double)c / (double)N;
 			const double T_new_c = T_current / speedup_c;
-			const double min_t_rank = (sum_w_cand > 1e-9) ? T_new_c * w_min_cand / sum_w_cand : T_new_c / c;
+			const double min_t_rank = (sum_w_cand > kEpsThroughput) ? T_new_c * w_min_cand / sum_w_cand : T_new_c / c;
 
 			if (min_t_rank < sc_c) {
 
@@ -1299,11 +1400,12 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 	if (candidate == -1) {
 
+		maybe_rebalance_same_size("no-scale-up-candidate", out, N, global_remaining, local_rem, global_throughput, rebalance_cost, max_data_bytes, bw, active_weights_ok, sum_w_active, w);
 		return out;
 
 	}
 
-	const double speedup = (active_weights_ok && sum_w_active > 1e-9 && sum_w_at_best > 1e-9) ? sum_w_at_best / sum_w_active : (double)candidate / (double)N;
+	const double speedup = (active_weights_ok && sum_w_active > kEpsThroughput && sum_w_at_best > kEpsThroughput) ? sum_w_at_best / sum_w_active : (double)candidate / (double)N;
 	const double T_new = T_current / speedup;
 
 	const int k_new = candidate - N;
@@ -1313,10 +1415,14 @@ static ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 	if (net_gain > 0.0) {
 
-		MAL_LOG_L(MAL_LOG_INFO, "AUTO", "Scale up: rem=%.0f T_curr=%.3fs T_new=%.3fs speedup=%.2fx gain=%.3fs cost=%.3fs → target=%d", global_remaining, T_current, T_new, speedup, net_gain, transfer_cost, candidate);
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale up: rem=%.0f T_curr=%.3fs T_new=%.3fs speedup=%.2fx gain=%.3fs cost=%.3fs → target=%d", global_remaining, T_current, T_new, speedup, net_gain, transfer_cost, candidate);
 
 		out.should_resize = true;
 		out.target_active_size = candidate;
+
+	} else {
+
+		maybe_rebalance_same_size("scale-up-net-gain<=0", out, N, global_remaining, local_rem, global_throughput, rebalance_cost, max_data_bytes, bw, active_weights_ok, sum_w_active, w);
 
 	}
 
@@ -1510,7 +1616,7 @@ static bool prepare_resize_if_needed() {
 
 			advance_default_sequence_after_commit();
 
-			MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Skipping no-op resize target=%d", consensus.active_size);
+			MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Skipping no-op resize target=%d", consensus.active_size);
 
 		}
 
@@ -1518,7 +1624,7 @@ static bool prepare_resize_if_needed() {
 
 	}
 
-	if (!consensus.unanimous || !consensus.should_resize || consensus.target == g.comm.a_size) {
+	if (!consensus.unanimous || !consensus.should_resize) {
 
 		return false;
 
@@ -1544,7 +1650,7 @@ static bool prepare_resize_if_needed() {
 
 	}
 
-	MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Prepared resize candidate target=%d (epoch=%llu)", consensus.target, consensus.decision_epoch);
+	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Prepared resize candidate target=%d (epoch=%llu)", consensus.target, consensus.decision_epoch);
 
 	return true;
 
@@ -1581,7 +1687,7 @@ static bool commit_prepared_resize_if_ready() {
 
 	}
 
-	unsigned long long epoch_now = g.sync.compute_epoch.load(std::memory_order_relaxed);
+	unsigned long long epoch_now = g.sync.compute_epoch.load(std::memory_order_acquire);
 	int local_changed = (epoch_now != prep_epoch) ? 1 : 0;
 	int any_changed = 0;
 
@@ -1593,19 +1699,19 @@ static bool commit_prepared_resize_if_ready() {
 
 		if (mode == MAL_EPOCH_CHANGE_USE_LAST_DECISION) {
 
-			MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Epoch changed; reusing prepared decision target=%d with existing data (mode=1)", prep_target);
+			MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Epoch changed; reusing prepared decision target=%d with existing data (mode=1)", prep_target);
 
 		} else {
 
-			MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Epoch changed; discarding prepared data and recalculating (mode=0)");
+			MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Epoch changed; discarding prepared data and recalculating (mode=0)");
 
 			prepared_work.reset();
 
 			ResizeConsensus refreshed = unanimous_resize_decision();
 
-			if (!refreshed.unanimous || !refreshed.should_resize || refreshed.target == g.comm.a_size) {
+			if (!refreshed.unanimous || !refreshed.should_resize) {
 
-				MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Recalculated decision: no valid resize needed (old_target=%d)", prep_target);
+				MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Recalculated decision: no valid resize needed (old_target=%d)", prep_target);
 				return false;
 
 			}
@@ -1648,7 +1754,7 @@ static bool commit_prepared_resize_if_ready() {
 	g.sync.resize_pending = true;
 	g.sync.notify();
 
-	MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Committing resize target=%d", prep_target);
+	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Committing resize target=%d", prep_target);
 
 	const double commit_t0 = MPI_Wtime();
 	prepared_work->commit_phase();
@@ -1657,11 +1763,11 @@ static bool commit_prepared_resize_if_ready() {
 	double commit_elapsed = 0.0;
 	MPI_Allreduce(&commit_elapsed_local, &commit_elapsed, 1, MPI_DOUBLE, MPI_MAX, g.comm.universe);
 
-	if (model_logp > 1e-9) {
+	if (model_logp > kEpsThroughput) {
 
-		const double cal_alpha = std::clamp(g.cfg.auto_calibration_alpha, 1e-6, 1.0);
-		const double bw_ref = (g.lb.auto_bw_est_bps > 1e-12) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
-		const double data_term = (bw_ref > 1e-12) ? (model_moved_bytes / bw_ref) : 0.0;
+		const double cal_alpha = std::clamp(g.cfg.auto_calibration_alpha, kEpsElapsed, 1.0);
+		const double bw_ref = (g.lb.auto_bw_est_bps > kEpsWeight) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
+		const double data_term = (bw_ref > kEpsWeight) ? (model_moved_bytes / bw_ref) : 0.0;
 
 		double alpha_sample = (commit_elapsed - data_term) / model_logp;
 		if (!std::isfinite(alpha_sample) || alpha_sample < 0.0) {
@@ -1672,7 +1778,7 @@ static bool commit_prepared_resize_if_ready() {
 
 		g.lb.auto_alpha_est_sec = cal_alpha * alpha_sample + (1.0 - cal_alpha) * g.lb.auto_alpha_est_sec;
 
-		if (model_moved_bytes > 1e-6 && commit_elapsed > 1e-9) {
+		if (model_moved_bytes > kEpsElapsed && commit_elapsed > kEpsThroughput) {
 
 			double beta_sample = (commit_elapsed - g.lb.auto_alpha_est_sec * model_logp) / model_moved_bytes;
 
@@ -1698,7 +1804,7 @@ static bool commit_prepared_resize_if_ready() {
 
 	}
 
-	MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Commit complete (active=%d)", g.comm.a_size);
+	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Commit complete (active=%d)", g.comm.a_size);
 
 	g.sync.notify();
 
@@ -1715,7 +1821,7 @@ static void progress_thread() {
 			#if defined(__arm64__) || defined(__aarch64__)
 
 				pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "worker: QoS set to E-Core");
+				MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "worker: QoS set to E-Core");
 
 			#elif defined(__x86_64__) || defined(__i386__)
 
@@ -1723,7 +1829,7 @@ static void progress_thread() {
 				thread_affinity_policy_data_t policy = { 1 };
 				thread_policy_set(self, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
 				mach_port_deallocate(mach_task_self(), self);
-				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "worker: affinity hint set to E-Core");
+				MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "worker: affinity hint set to E-Core");
 
 			#endif
 
@@ -1735,7 +1841,7 @@ static void progress_thread() {
 
 		for (;;) {
 
-			std::deque<std::function<void()>> batch;
+			std::vector<std::function<void()>> batch;
 
 			{
 
@@ -1777,7 +1883,7 @@ static void progress_thread() {
 
 		}
 
-		if (g.sync.attach_pending.load()) {
+		if (g.sync.attach_pending.load(std::memory_order_acquire)) {
 
 			continue;
 
@@ -1795,4 +1901,3 @@ static void progress_thread() {
 }
 
 #endif
-

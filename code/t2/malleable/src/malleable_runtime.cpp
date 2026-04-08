@@ -378,6 +378,96 @@ static void load_env_config() {
 
 	}
 
+	if (const char* v = std::getenv("MAL_AUTO_REBALANCE_MIN_REL_GAIN")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val <= 0.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_REBALANCE_MIN_REL_GAIN='%s' (must be > 0)", v);
+
+		} else {
+
+			g.cfg.auto_rebalance_min_rel_gain = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_REBALANCE_MIN_REL_GAIN=%.4f", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_REBALANCE_GAIN_MARGIN")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val < 1.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_REBALANCE_GAIN_MARGIN='%s' (must be >= 1.0)", v);
+
+		} else {
+
+			g.cfg.auto_rebalance_gain_margin = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_REBALANCE_GAIN_MARGIN=%.4f", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_REBALANCE_MIN_STREAK")) {
+
+		char* end = nullptr;
+		long val = std::strtol(v, &end, 10);
+
+		if (end == v || val <= 0 || val > INT_MAX) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_REBALANCE_MIN_STREAK='%s' (must be in [1, %d])", v, INT_MAX);
+
+		} else {
+
+			g.cfg.auto_rebalance_min_streak = (int)val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_REBALANCE_MIN_STREAK=%ld", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS")) {
+
+		char* end = nullptr;
+		long val = std::strtol(v, &end, 10);
+
+		if (end == v || val < 0 || val > INT_MAX) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS='%s' (must be in [0, %d])", v, INT_MAX);
+
+		} else {
+
+			g.cfg.auto_rebalance_cooldown_epochs = (int)val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS=%ld", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK")) {
+
+		char* end = nullptr;
+		long val = std::strtol(v, &end, 10);
+
+		if (end == v || val <= 0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK='%s' (must be > 0)", v);
+
+		} else {
+
+			g.cfg.auto_rebalance_min_remaining_per_rank = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK=%ld", val);
+
+		}
+
+	}
+
 }
 
 void mal_init(MalResizePolicy policy) {
@@ -438,7 +528,7 @@ void mal_init(MalResizePolicy policy) {
 
 		g.sync.compute_wait([] {
 
-			return g.comm.active != MPI_COMM_NULL || g.sync.stop.load();
+			return g.comm.active != MPI_COMM_NULL || g.sync.stop.load(std::memory_order_acquire);
 
 		});
 
@@ -794,7 +884,7 @@ static void advance_next_range(MalFor& f) {
 
 	prime_range_start(f);
 
-	MAL_LOG_L(MAL_LOG_INFO, "RANGE", "Next range [%ld, %ld) (base=%ld)", a, b, current_range_local_base(f));
+	MAL_LOG_L(MAL_LOG_DEBUG, "RANGE", "Next range [%ld, %ld) (base=%ld)", a, b, current_range_local_base(f));
 
 }
 
@@ -808,7 +898,7 @@ void mal_check_for(MalFor& f) {
 
 		g.sync.compute_wait([] {
 
-			return !g.sync.attach_pending.load() || g.sync.stop.load();
+			return !g.sync.attach_pending.load(std::memory_order_acquire) || g.sync.stop.load(std::memory_order_acquire);
 
 		});
 
@@ -826,7 +916,7 @@ void mal_check_for(MalFor& f) {
 
 		g.sync.compute_wait([] {
 
-			return !g.sync.resize_pending.load() || g.sync.stop.load();
+			return !g.sync.resize_pending.load(std::memory_order_acquire) || g.sync.stop.load(std::memory_order_acquire);
 
 		});
 
@@ -1145,9 +1235,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	g.shared.push_back(std::move(sp));
 
-	if (!g.sync.stop.load(std::memory_order_relaxed) &&
-		f.start < f.end &&
-		(!async_attach || !g.sync.attach_pending.load(std::memory_order_relaxed))) {
+	if (!g.sync.stop.load(std::memory_order_relaxed) && f.start < f.end && (!async_attach || !g.sync.attach_pending.load(std::memory_order_relaxed))) {
 
 		f.phase.store(MAL_LOOP_RUNNING, std::memory_order_relaxed);
 

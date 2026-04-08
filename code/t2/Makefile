@@ -4,8 +4,9 @@ MPIRUN = mpirun
 
 NP = 4
 MAL_DEFAULT_RESIZE_SEQ = 2,4,4,3,1,4
+MAL_LOG_LEVEL = MAL_LOG_DEBUG
 
-CXXFLAGS = -O2 -Wall -std=c++20 -MMD -MP -Imalleable/include -DMAL_DEFAULT_RESIZE_SEQ=\"$(MAL_DEFAULT_RESIZE_SEQ)\"
+CXXFLAGS = -O2 -Wall -std=c++20 -MMD -MP -Imalleable/include -DMAL_DEFAULT_RESIZE_SEQ=\"$(MAL_DEFAULT_RESIZE_SEQ)\" -DMAL_LOG_LEVEL=$(MAL_LOG_LEVEL)
 LIBS = -lpthread
 
 BUILD_DIR = build
@@ -26,11 +27,15 @@ TARGET_MM = $(BUILD_DIR)/matmul
 SRCS_MM = examples/matmul.cpp
 OBJS_MM = $(SRCS_MM:%.cpp=$(BUILD_DIR)/%.o)
 
-DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MM:.o=.d)
+TARGET_SP = $(BUILD_DIR)/sparse
+SRCS_SP = examples/sparse.cpp
+OBJS_SP = $(SRCS_SP:%.cpp=$(BUILD_DIR)/%.o)
 
-.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmul run_matvec test clean re
+DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MM:.o=.d) $(OBJS_SP:.o=.d)
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MM)
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmul run_matvec run_sparse test clean re
+
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MM) $(TARGET_SP)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -45,6 +50,9 @@ $(TARGET_VEC): $(LIB_MAL) $(OBJS_VEC)
 
 $(TARGET_MM): $(LIB_MAL) $(OBJS_MM)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MM) $(LIB_MAL) $(LIBS)
+
+$(TARGET_SP): $(LIB_MAL) $(OBJS_SP)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SP) $(LIB_MAL) $(LIBS)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -64,6 +72,9 @@ run_matmul: $(TARGET_MM)
 
 run_matvec: $(TARGET_MM)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MM) mv
+
+run_sparse: $(TARGET_SP)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SP)
 
 test: all
 	@out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) 2>&1`; \

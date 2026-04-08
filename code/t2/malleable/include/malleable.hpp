@@ -75,6 +75,36 @@
 
 #endif
 
+#ifndef MAL_AUTO_REBALANCE_MIN_REL_GAIN
+
+	#define MAL_AUTO_REBALANCE_MIN_REL_GAIN 0.05
+
+#endif
+
+#ifndef MAL_AUTO_REBALANCE_GAIN_MARGIN
+
+	#define MAL_AUTO_REBALANCE_GAIN_MARGIN 1.20
+
+#endif
+
+#ifndef MAL_AUTO_REBALANCE_MIN_STREAK
+
+	#define MAL_AUTO_REBALANCE_MIN_STREAK 2
+
+#endif
+
+#ifndef MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS
+
+	#define MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS 2
+
+#endif
+
+#ifndef MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK
+
+	#define MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK 64
+
+#endif
+
 #define MAL_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define MAL_LIKELY(x) __builtin_expect(!!(x), 1)
 #define MAL_UNLIKELY(x) __builtin_expect(!!(x), 0)

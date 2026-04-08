@@ -73,7 +73,8 @@ struct TransferPlanEntry {
 
 class BufferPool {
 
-	static constexpr int kTLCacheSlots = 8;
+	static constexpr int kTLCacheSlots = 16;
+	static constexpr size_t kSmallAllocThreshold = 256;
 
 	struct Entry {
 		void* ptr;
@@ -164,7 +165,21 @@ public:
 
 	void* acquire(size_t min_bytes) {
 
-		size_t key = bucket_key(min_bytes > 0 ? min_bytes : 1);
+		if (min_bytes <= kSmallAllocThreshold) {
+
+			void* p = std::malloc(min_bytes > 0 ? min_bytes : 1);
+
+			if (MAL_UNLIKELY(!p)) {
+
+				throw std::bad_alloc();
+
+			}
+
+			return p;
+
+		}
+
+		size_t key = bucket_key(min_bytes);
 
 		TLMap& tlm = tl_map();
 		auto tlit = tlm.find(key);
@@ -217,7 +232,15 @@ public:
 
 		}
 
-		size_t key = bucket_key(capacity > 0 ? capacity : 1);
+		if (capacity <= kSmallAllocThreshold) {
+
+			std::free(ptr);
+
+			return;
+
+		}
+
+		size_t key = bucket_key(capacity);
 		TLBucket& tb = tl_map()[key];
 
 		if (MAL_LIKELY(tb.count < kTLCacheSlots)) {
@@ -236,14 +259,7 @@ public:
 
 static BufferPool g_buffer_pool;
 
-struct MalData {
-
-	virtual ~MalData() = default;
-	virtual void free_resources() = 0;
-
-};
-
-struct alignas(64) MalVec : MalData {
+struct alignas(64) MalVec {
 
 	void* buf{nullptr};
 	void** user_ptr{nullptr};
@@ -255,18 +271,16 @@ struct alignas(64) MalVec : MalData {
 	long total_N{0};
 
 	long plan_origin_n{0};
-	int gather_root{-1};
 	void* result_buf{nullptr};
-
-	std::vector<std::pair<long,long>> done_segs;
-
-	MalAttachPolicy attach_policy{MAL_ATTACH_PARTITIONED};
-	MalDataAccessMode access_mode{MAL_ACCESS_READ_WRITE};
-
-	bool cache_valid{false};
 	long cache_start{0};
 	long cache_end{0};
 	long cache_local_off{0};
+	int gather_root{-1};
+	MalAttachPolicy attach_policy{MAL_ATTACH_PARTITIONED};
+	MalDataAccessMode access_mode{MAL_ACCESS_READ_WRITE};
+	bool cache_valid{false};
+
+	std::vector<std::pair<long,long>> done_segs;
 
 	MAL_ALWAYS_INLINE void sync_user_ptr() noexcept {
 
@@ -280,35 +294,35 @@ struct alignas(64) MalVec : MalData {
 
 	}
 
-	void free_resources() override;
+	void free_resources();
 
 };
 
 struct MalAcc {
 
-	int result_rank{0};
 	void* ptr{nullptr};
-	int dtype_idx{1};
-	int dop_idx{0};
-	size_t esz{sizeof(long)};
-
 	void (*fn_get) (const void*, void*){nullptr};
 	void (*fn_set) (void*, const void*){nullptr};
 	void (*fn_add) (void*, const void*){nullptr};
 	void (*fn_reset)(void*) {nullptr};
+	size_t esz{sizeof(long)};
 
 	std::vector<char> epoch_buf;
 
+	int result_rank{0};
+	int dtype_idx{1};
+	int dop_idx{0};
+
 };
 
-struct SharedMat : MalData {
+struct SharedMat {
 
 	void* buf{nullptr};
 	size_t total_bytes{0};
 	bool user_owned{false};
 	void** user_ptr{nullptr};
 
-	void free_resources() override;
+	void free_resources();
 
 };
 
@@ -375,6 +389,11 @@ struct MalState {
 		double auto_sync_overhead_frac{MAL_AUTO_SYNC_OVERHEAD_FRAC};
 		double auto_thr_ewma_alpha{MAL_AUTO_THR_EWMA_ALPHA};
 		double auto_calibration_alpha{MAL_AUTO_CALIBRATION_ALPHA};
+		double auto_rebalance_min_rel_gain{MAL_AUTO_REBALANCE_MIN_REL_GAIN};
+		double auto_rebalance_gain_margin{MAL_AUTO_REBALANCE_GAIN_MARGIN};
+		int auto_rebalance_min_streak{MAL_AUTO_REBALANCE_MIN_STREAK};
+		int auto_rebalance_cooldown_epochs{MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS};
+		long auto_rebalance_min_remaining_per_rank{MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK};
 
 		bool affinity_enabled{MAL_AFFINITY_ENABLED != 0};
 		int main_core{MAL_MAIN_CORE_DEFAULT};
@@ -392,12 +411,16 @@ struct MalState {
 		alignas(64) std::atomic<bool> resize_pending{false};
 		alignas(64) std::atomic<bool> attach_pending{false};
 		alignas(64) std::atomic<bool> stop{false};
+		alignas(64) std::atomic<bool> loop_has_new_work{false};
 		alignas(64) std::atomic<unsigned long long> compute_epoch{0};
 
 		template<typename Pred>
 		void compute_wait(Pred ready) {
 
-			compute_ready = true;
+			{
+				std::lock_guard lk(mu);
+				compute_ready.store(true, std::memory_order_relaxed);
+			}
 
 			cv.notify_one();
 
@@ -408,23 +431,17 @@ struct MalState {
 
 			}
 
-			compute_ready = false;
+			compute_ready.store(false, std::memory_order_relaxed);
 
 		}
 
 		void wait_for_compute() {
 
-			if (compute_ready) {
-
-				return;
-
-			}
-
 			std::unique_lock lk(mu);
 
 			cv.wait(lk, [this] {
 
-				return compute_ready.load() || stop.load();
+				return compute_ready.load(std::memory_order_relaxed) || stop.load(std::memory_order_relaxed);
 
 			});
 
@@ -469,6 +486,8 @@ struct MalState {
 		double auto_thr_ewma{0.0};
 		double auto_bw_est_bps{MAL_AUTO_BANDWIDTH_BPS};
 		double auto_alpha_est_sec{0.0};
+		int auto_same_size_streak{0};
+		int auto_same_size_cooldown{0};
 
 	} lb;
 
@@ -476,7 +495,7 @@ struct MalState {
 	PreparedResize prepared_resize;
 
 	std::mutex attach_mu;
-	std::deque<std::function<void()>> attach_tasks;
+	std::vector<std::function<void()>> attach_tasks;
 
 	MalFor* loop{nullptr};
 
@@ -499,7 +518,7 @@ static MalState g;
 
 MalFor::~MalFor() {
 
-	phase.store(MAL_LOOP_FINISHED, std::memory_order_relaxed);
+	phase.store(MAL_LOOP_FINISHED, std::memory_order_release);
 
 	if (g.loop == this) {
 
@@ -525,7 +544,7 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 	other.start = 0;
 	other.end = 0;
 	other.plan_idx = 0;
-	other.phase.store(MAL_LOOP_FINISHED, std::memory_order_relaxed);
+	other.phase.store(MAL_LOOP_FINISHED, std::memory_order_release);
 
 }
 
@@ -703,7 +722,7 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 		} else {
 
-			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: pinned to core %d", label, core_id);
+			MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: pinned to core %d", label, core_id);
 
 		}
 
@@ -719,11 +738,11 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 				core_id = *core;
 
-				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: auto-selected %s core %d", label, want_pcore ? "P-core" : "E-core", core_id);
+				MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: auto-selected %s core %d", label, want_pcore ? "P-core" : "E-core", core_id);
 
 			} else {
 
-				MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: no %s core found, not pinning", label, want_pcore ? "P-core" : "E-core");
+				MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: no %s core found, not pinning", label, want_pcore ? "P-core" : "E-core");
 
 				return;
 
@@ -731,7 +750,7 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 		} else {
 
-			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: using configured core %d", label, core_id);
+			MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: using configured core %d", label, core_id);
 
 		}
 
@@ -757,14 +776,14 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 			pthread_set_qos_class_self_np(qos, 0);
 
-			MAL_LOG_L( MAL_LOG_INFO, "AFFINITY", "%s: QoS set to %s", label, want_pcore ? "P-core" : "E-core");
+			MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: QoS set to %s", label, want_pcore ? "P-core" : "E-core");
 
 		#else
 
 			(void)is_self;
 			(void)want_pcore;
 
-			MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "%s: affinity not supported on Intel macOS", label);
+			MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: affinity not supported on Intel macOS", label);
 
 		#endif
 
@@ -776,7 +795,7 @@ static void pin_main_thread_to_pcore() noexcept {
 
 	if (!g.cfg.affinity_enabled) {
 
-		MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "main: pinning disabled");
+		MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "main: pinning disabled");
 
 		return;
 
@@ -814,7 +833,7 @@ static void pin_worker_thread_to_ecore(std::thread& t) noexcept {
 
 	if (!g.cfg.affinity_enabled) {
 
-		MAL_LOG_L(MAL_LOG_INFO, "AFFINITY", "worker: pinning disabled");
+		MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "worker: pinning disabled");
 
 		return;
 
@@ -1124,7 +1143,7 @@ static void dispatch_attach_task(std::function<void()> fn, bool async) {
 	std::unique_lock lk(state->mu);
 	state->cv.wait(lk, [&] {
 
-		return state->done || g.sync.stop.load();
+		return state->done || g.sync.stop.load(std::memory_order_acquire);
 
 	});
 
@@ -1136,7 +1155,7 @@ void mal_wait_attach_tasks() {
 
 	g.sync.cv.wait(lk, [] {
 
-		return !g.sync.attach_pending.load() || g.sync.stop.load();
+		return !g.sync.attach_pending.load(std::memory_order_acquire) || g.sync.stop.load(std::memory_order_acquire);
 
 	});
 
@@ -1160,7 +1179,14 @@ static void run_attach_bcast_once_all(void* buf, size_t bytes, bool wait = true)
 
 static bool has_work_or_stop() {
 
-	return g.sync.stop.load() || g.sync.attach_pending.load() || (g.pending && !g.pending->ranges.empty()) || (g.loop && g.loop->current < g.loop->end);
+	if (g.sync.stop.load(std::memory_order_acquire)) return true;
+	if (g.sync.attach_pending.load(std::memory_order_acquire)) return true;
+	if (g.sync.loop_has_new_work.load(std::memory_order_acquire)) {
+		g.sync.loop_has_new_work.store(false, std::memory_order_relaxed);
+		return true;
+	}
+	std::lock_guard lk(g.resize_mu);
+	return g.pending && !g.pending->ranges.empty();
 
 }
 
@@ -1216,12 +1242,7 @@ static bool vec_is_fully_replicated(const MalVec& v) noexcept {
 
 static void configure_shared_active_vec(MalVec& v, size_t buf_need) {
 
-	if (v.buf && v.buf_bytes >= buf_need &&
-		v.local_n == v.total_N &&
-		v.done_n == 0 &&
-		v.buf_global_start == 0 &&
-		v.plan_origin_n == 0 &&
-		!v.cache_valid) {
+	if (v.buf && v.buf_bytes >= buf_need && v.local_n == v.total_N && v.done_n == 0 && v.buf_global_start == 0 && v.plan_origin_n == 0 && !v.cache_valid) {
 
 		return;
 
@@ -1578,7 +1599,6 @@ static void load_pending_ranges_into_loop(MalFor& f) {
 
 	f.phase.store(MAL_LOOP_ATTACHING, std::memory_order_relaxed);
 
-	// Update MalVec mappings for new ranges inline
 	for (MalVec* v : f.vecs) {
 
 		if (!v || vec_is_fully_replicated(*v)) {
@@ -1682,6 +1702,20 @@ static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 		}
 
 		ai = ae;
+
+	}
+
+	static constexpr size_t kMaxTLBatchCap = 256 * 1024;
+
+	if (tl_send.capacity() > kMaxTLBatchCap) {
+
+		tl_send.shrink_to_fit();
+
+	}
+
+	if (tl_recv.capacity() > kMaxTLBatchCap) {
+
+		tl_recv.shrink_to_fit();
 
 	}
 
@@ -1809,9 +1843,14 @@ static std::vector<long> build_partition_cuts(long total, int nprocs) {
 	}
 
 	double sum_w = 0.0;
+
 	if ((int)w.size() >= nprocs) {
 
-		for (int r = 0; r < nprocs; r++) sum_w += w[r];
+		for (int r = 0; r < nprocs; r++) {
+
+			sum_w += w[r];
+
+		}
 
 	}
 
@@ -2206,10 +2245,7 @@ void SharedMat::free_resources() {
 
 }
 
-static std::vector<std::pair<long,long>>
-slice_remaining(const std::vector<std::pair<long,long>>& remaining,
-	const std::vector<long>& offsets,
-	long vstart, long vend) {
+static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::pair<long,long>>& remaining, std::vector<long>& offsets, long vstart, long vend) {
 
 	std::vector<std::pair<long,long>> out;
 	out.reserve(remaining.size());
@@ -2348,4 +2384,3 @@ static bool vec_reuse_local_copy(MalVec& v, const std::vector<std::pair<long,lon
 }
 
 #endif
-
