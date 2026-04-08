@@ -168,7 +168,7 @@ template<> struct MpiType<unsigned long> { static MPI_Datatype value() { return 
 template<> struct MpiType<float> { static MPI_Datatype value() { return MPI_FLOAT; } };
 template<> struct MpiType<double> { static MPI_Datatype value() { return MPI_DOUBLE; } };
 
-struct MalFor {
+struct alignas(64) MalFor {
 
 	long start{0};
 	long end{0};
@@ -176,12 +176,12 @@ struct MalFor {
 	long* user_iter{nullptr};
 	long* user_limit{nullptr};
 	std::atomic<MalLoopPhase> phase{MAL_LOOP_WAITING_ACTIVATION};
-
 	size_t plan_idx{0};
+
+	char _cold_pad[8]{};
 
 	std::vector<std::pair<long,long>> plan_ranges;
 	std::vector<long> plan_local_bases;
-
 	std::vector<MalVec*> vecs;
 	std::vector<MalAcc*> accs;
 

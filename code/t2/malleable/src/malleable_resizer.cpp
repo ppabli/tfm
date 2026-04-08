@@ -756,6 +756,13 @@ void Resizer::apply_active() {
 	if (publish_pending_after_broadcast && g.pending) {
 
 		g.pending->ranges = std::move(deferred_pending_ranges);
+
+		if (!g.pending->ranges.empty()) {
+
+			g.sync.pending_has_ranges.store(true, std::memory_order_release);
+
+		}
+
 		g.sync.notify();
 
 	}

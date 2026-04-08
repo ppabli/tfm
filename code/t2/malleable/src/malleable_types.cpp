@@ -404,15 +404,16 @@ struct MalState {
 
 	struct SyncBarrier {
 
-		std::mutex mu;
-		std::condition_variable cv;
-
 		alignas(64) std::atomic<bool> compute_ready{false};
 		alignas(64) std::atomic<bool> resize_pending{false};
 		alignas(64) std::atomic<bool> attach_pending{false};
 		alignas(64) std::atomic<bool> stop{false};
 		alignas(64) std::atomic<bool> loop_has_new_work{false};
+		alignas(64) std::atomic<bool> pending_has_ranges{false};
 		alignas(64) std::atomic<unsigned long long> compute_epoch{0};
+
+		alignas(64) std::mutex mu;
+		std::condition_variable cv;
 
 		template<typename Pred>
 		void compute_wait(Pred ready) {
@@ -1182,11 +1183,13 @@ static bool has_work_or_stop() {
 	if (g.sync.stop.load(std::memory_order_acquire)) return true;
 	if (g.sync.attach_pending.load(std::memory_order_acquire)) return true;
 	if (g.sync.loop_has_new_work.load(std::memory_order_acquire)) {
+
 		g.sync.loop_has_new_work.store(false, std::memory_order_relaxed);
 		return true;
+
 	}
-	std::lock_guard lk(g.resize_mu);
-	return g.pending && !g.pending->ranges.empty();
+
+	return g.sync.pending_has_ranges.load(std::memory_order_acquire);
 
 }
 
@@ -1582,6 +1585,7 @@ static void load_pending_ranges_into_loop(MalFor& f) {
 	install_loop_plan(f, g.pending->ranges);
 
 	g.pending->ranges.clear();
+	g.sync.pending_has_ranges.store(false, std::memory_order_relaxed);
 
 	f.current = f.start;
 
