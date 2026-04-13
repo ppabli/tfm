@@ -2,6 +2,7 @@
 
 #include <mpi.h>
 #include <atomic>
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <functional>
@@ -11,7 +12,7 @@
 
 #ifndef MAL_INITIAL_SIZE
 
-	#define MAL_INITIAL_SIZE 1
+	#define MAL_INITIAL_SIZE INT_MAX
 
 #endif
 
@@ -42,66 +43,11 @@
 #ifndef MAL_WORKER_CORE_DEFAULT
 
 	#define MAL_WORKER_CORE_DEFAULT -1
-
 #endif
 
 #ifndef MAL_EPOCH_CHANGE_MODE
 
 	#define MAL_EPOCH_CHANGE_MODE 0
-
-#endif
-
-#ifndef MAL_AUTO_BANDWIDTH_BPS
-
-	#define MAL_AUTO_BANDWIDTH_BPS 1e9
-
-#endif
-
-#ifndef MAL_AUTO_SYNC_OVERHEAD_FRAC
-
-	#define MAL_AUTO_SYNC_OVERHEAD_FRAC 0.05
-
-#endif
-
-#ifndef MAL_AUTO_THR_EWMA_ALPHA
-
-	#define MAL_AUTO_THR_EWMA_ALPHA 0.25
-
-#endif
-
-#ifndef MAL_AUTO_CALIBRATION_ALPHA
-
-	#define MAL_AUTO_CALIBRATION_ALPHA 0.20
-
-#endif
-
-#ifndef MAL_AUTO_REBALANCE_MIN_REL_GAIN
-
-	#define MAL_AUTO_REBALANCE_MIN_REL_GAIN 0.05
-
-#endif
-
-#ifndef MAL_AUTO_REBALANCE_GAIN_MARGIN
-
-	#define MAL_AUTO_REBALANCE_GAIN_MARGIN 1.20
-
-#endif
-
-#ifndef MAL_AUTO_REBALANCE_MIN_STREAK
-
-	#define MAL_AUTO_REBALANCE_MIN_STREAK 2
-
-#endif
-
-#ifndef MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS
-
-	#define MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS 2
-
-#endif
-
-#ifndef MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK
-
-	#define MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK 64
 
 #endif
 
@@ -154,9 +100,9 @@ enum MalDataAccessMode {
 
 enum MalResizePolicy {
 	MAL_RESIZE_POLICY_AUTO,
+	MAL_RESIZE_POLICY_THROUGHPUT,
+	MAL_RESIZE_POLICY_ENERGY,
 	MAL_RESIZE_POLICY_FIXED_SEQUENCE,
-	MAL_RESIZE_POLICY_HW_COUNTERS,
-	MAL_RESIZE_POLICY_REMAINING_ITERS,
 };
 
 template<typename T> struct MpiType;
@@ -297,6 +243,34 @@ namespace detail {
 
 	void acc_register(MalFor& f, AccDesc d, int result_rank);
 
+	template<typename T>
+	inline void acc_get_t(const void* p, void* d) {
+
+		*static_cast<T*>(d) = *static_cast<const T*>(p);
+
+	}
+
+	template<typename T>
+	inline void acc_set_t(void* p, const void* s) {
+
+		*static_cast<T*>(p) = *static_cast<const T*>(s);
+
+	}
+
+	template<typename T>
+	inline void acc_add_t(void* p, const void* s) {
+
+		*static_cast<T*>(p) += *static_cast<const T*>(s);
+
+	}
+
+	template<typename T>
+	inline void acc_reset_t(void* p) {
+
+		*static_cast<T*>(p) = T{};
+
+	}
+
 }
 
 template<typename T>
@@ -304,10 +278,10 @@ inline void mal_attach_acc(MalFor& f, T& acc, MPI_Datatype dtype, MPI_Op op, int
 
 	detail::acc_register(f, {
 		&acc, dtype, op, sizeof(T),
-		[](const void* p, void* d) { *static_cast<T*>(d) = *static_cast<const T*>(p); },
-		[](void* p, const void* s) { *static_cast<T*>(p) = *static_cast<const T*>(s); },
-		[](void* p, const void* s) { *static_cast<T*>(p) += *static_cast<const T*>(s); },
-		[](void* p) { *static_cast<T*>(p) = T{}; },
+		detail::acc_get_t<T>,
+		detail::acc_set_t<T>,
+		detail::acc_add_t<T>,
+		detail::acc_reset_t<T>,
 	}, result_rank);
 
 }

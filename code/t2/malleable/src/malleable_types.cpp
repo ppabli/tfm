@@ -52,6 +52,15 @@ struct ResizeDecision {
 
 	bool should_resize{false};
 	int target_active_size{-1};
+	bool post_eval_valid{false};
+	int post_eval_from_n{0};
+	int post_eval_to_n{0};
+	double post_eval_decision_time{0.0};
+	double post_eval_pred_net_gain{0.0};
+	double post_eval_pred_rel_gain{0.0};
+	double post_eval_pred_score{0.0};
+	double post_eval_baseline_thr{0.0};
+	double post_eval_baseline_remaining{0.0};
 
 };
 
@@ -385,20 +394,21 @@ struct MalState {
 		std::atomic<bool> enabled{true};
 		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
 
-		double auto_bandwidth_bps{MAL_AUTO_BANDWIDTH_BPS};
-		double auto_sync_overhead_frac{MAL_AUTO_SYNC_OVERHEAD_FRAC};
-		double auto_thr_ewma_alpha{MAL_AUTO_THR_EWMA_ALPHA};
-		double auto_calibration_alpha{MAL_AUTO_CALIBRATION_ALPHA};
-		double auto_rebalance_min_rel_gain{MAL_AUTO_REBALANCE_MIN_REL_GAIN};
-		double auto_rebalance_gain_margin{MAL_AUTO_REBALANCE_GAIN_MARGIN};
-		int auto_rebalance_min_streak{MAL_AUTO_REBALANCE_MIN_STREAK};
-		int auto_rebalance_cooldown_epochs{MAL_AUTO_REBALANCE_COOLDOWN_EPOCHS};
-		long auto_rebalance_min_remaining_per_rank{MAL_AUTO_REBALANCE_MIN_REMAINING_PER_RANK};
+		double auto_bandwidth_bps{1e9};
+		double auto_sync_overhead_frac{0.05};
+		double auto_thr_ewma_alpha{0.30};
+		double auto_calibration_alpha{0.20};
+		double auto_trust_guard_cap{2.0};
+		double auto_min_rel_gain_floor{0.02};
+		double auto_min_rel_gain_cap{0.30};
+		int auto_candidate_radius{1};
+		int auto_candidate_stride{4};
 
 		bool affinity_enabled{MAL_AFFINITY_ENABLED != 0};
 		int main_core{MAL_MAIN_CORE_DEFAULT};
 		int worker_core{MAL_WORKER_CORE_DEFAULT};
 		int resolved_main_core{-1};
+		int initial_size{MAL_INITIAL_SIZE};
 
 	} cfg;
 
@@ -440,11 +450,11 @@ struct MalState {
 
 			std::unique_lock lk(mu);
 
-			cv.wait(lk, [this] {
+			while (!compute_ready.load(std::memory_order_relaxed) && !stop.load(std::memory_order_relaxed)) {
 
-				return compute_ready.load(std::memory_order_relaxed) || stop.load(std::memory_order_relaxed);
+				cv.wait(lk);
 
-			});
+			}
 
 		}
 
@@ -460,6 +470,16 @@ struct MalState {
 
 		int target{-1};
 		unsigned long long decision_epoch{0};
+		unsigned long long local_decision_epoch{0};
+		bool post_eval_valid{false};
+		int post_eval_from_n{0};
+		int post_eval_to_n{0};
+		double post_eval_decision_time{0.0};
+		double post_eval_pred_net_gain{0.0};
+		double post_eval_pred_rel_gain{0.0};
+		double post_eval_pred_score{0.0};
+		double post_eval_baseline_thr{0.0};
+		double post_eval_baseline_remaining{0.0};
 		std::unique_ptr<Resizer> work;
 
 		bool ready() const noexcept {
@@ -472,6 +492,16 @@ struct MalState {
 
 			target = -1;
 			decision_epoch = 0;
+			local_decision_epoch = 0;
+			post_eval_valid = false;
+			post_eval_from_n = 0;
+			post_eval_to_n = 0;
+			post_eval_decision_time = 0.0;
+			post_eval_pred_net_gain = 0.0;
+			post_eval_pred_rel_gain = 0.0;
+			post_eval_pred_score = 0.0;
+			post_eval_baseline_thr = 0.0;
+			post_eval_baseline_remaining = 0.0;
 			work.reset();
 
 		}
@@ -485,10 +515,31 @@ struct MalState {
 		long epoch_assigned{0};
 		double alpha{0.3};
 		double auto_thr_ewma{0.0};
-		double auto_bw_est_bps{MAL_AUTO_BANDWIDTH_BPS};
+		double auto_bw_est_bps{0.0};
 		double auto_alpha_est_sec{0.0};
-		int auto_same_size_streak{0};
-		int auto_same_size_cooldown{0};
+		double sync_wait_est_sec{0.0};
+
+		int resize_cooldown{0};
+		int same_size_rebalance_cooldown{0};
+
+		long long papi_prev_vals[kNumPapiEvents]{};
+
+		double global_mem_bound{0.0};
+		double global_ipc_ewma{0.0};
+		double ipc_peak_ref{0.0};
+		double ipc_drop_ewma{0.0};
+		double benefit_trust{1.0};
+		double migration_aversion{1.0};
+
+		bool post_eval_pending{false};
+		int post_eval_from_n{0};
+		int post_eval_to_n{0};
+		double post_eval_decision_time{0.0};
+		double post_eval_pred_net_gain{0.0};
+		double post_eval_pred_rel_gain{0.0};
+		double post_eval_pred_score{0.0};
+		double post_eval_baseline_thr{0.0};
+		double post_eval_baseline_remaining{0.0};
 
 	} lb;
 
@@ -792,7 +843,7 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 #endif
 
-static void pin_main_thread_to_pcore() noexcept {
+void pin_main_thread_to_pcore() noexcept {
 
 	if (!g.cfg.affinity_enabled) {
 
@@ -830,7 +881,7 @@ static void pin_main_thread_to_pcore() noexcept {
 
 }
 
-static void pin_worker_thread_to_ecore(std::thread& t) noexcept {
+void pin_worker_thread_to_ecore(std::thread& t) noexcept {
 
 	if (!g.cfg.affinity_enabled) {
 
@@ -897,30 +948,30 @@ const char* mal_log_reset_color() {
 
 }
 
-static const MPI_Datatype kDtypeTbl[] = {MPI_INT, MPI_LONG, MPI_LONG_LONG, MPI_UNSIGNED, MPI_UNSIGNED_LONG, MPI_FLOAT, MPI_DOUBLE};
+const MPI_Datatype kDtypeTbl[] = {MPI_INT, MPI_LONG, MPI_LONG_LONG, MPI_UNSIGNED, MPI_UNSIGNED_LONG, MPI_FLOAT, MPI_DOUBLE};
 
-static const MPI_Op kDopTbl[] = {MPI_SUM, MPI_PROD, MPI_MAX, MPI_MIN};
+const MPI_Op kDopTbl[] = {MPI_SUM, MPI_PROD, MPI_MAX, MPI_MIN};
 
-static constexpr int kDtypeINT = 0;
-static constexpr int kDtypeLONG = 1;
-static constexpr int kDtypeLLONG = 2;
-static constexpr int kDtypeUINT = 3;
-static constexpr int kDtypeULONG = 4;
-static constexpr int kDtypeFLOAT = 5;
-static constexpr int kDtypeDOUBLE = 6;
+constexpr int kDtypeINT = 0;
+constexpr int kDtypeLONG = 1;
+constexpr int kDtypeLLONG = 2;
+constexpr int kDtypeUINT = 3;
+constexpr int kDtypeULONG = 4;
+constexpr int kDtypeFLOAT = 5;
+constexpr int kDtypeDOUBLE = 6;
 
-static constexpr int kDopSUM = 0;
-static constexpr int kDopPROD = 1;
-static constexpr int kDopMAX = 2;
-static constexpr int kDopMIN = 3;
+constexpr int kDopSUM = 0;
+constexpr int kDopPROD = 1;
+constexpr int kDopMAX = 2;
+constexpr int kDopMIN = 3;
 
-static MPI_Datatype tag_dtype(int t) noexcept {
+inline MPI_Datatype tag_dtype(int t) noexcept {
 
 	return (t >= 0 && t < (int)std::size(kDtypeTbl)) ? kDtypeTbl[t] : MPI_LONG;
 
 }
 
-static int dtype_tag(MPI_Datatype d) noexcept {
+inline int dtype_tag(MPI_Datatype d) noexcept {
 
 	for (int i = 0; i < (int)std::size(kDtypeTbl); i++) {
 
@@ -936,7 +987,7 @@ static int dtype_tag(MPI_Datatype d) noexcept {
 
 }
 
-static int dop_tag(MPI_Op d) noexcept {
+inline int dop_tag(MPI_Op d) noexcept {
 
 	for (int i = 0; i < (int)std::size(kDopTbl); i++) {
 
@@ -952,13 +1003,13 @@ static int dop_tag(MPI_Op d) noexcept {
 
 }
 
-static MPI_Op tag_dop(int t) noexcept {
+inline MPI_Op tag_dop(int t) noexcept {
 
 	return (t >= 0 && t < (int)std::size(kDopTbl)) ? kDopTbl[t] : MPI_SUM;
 
 }
 
-static void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
+void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
 
 	union { int i; long l; long long ll; unsigned u; unsigned long ul; float f; double d; } v{};
 
@@ -1010,7 +1061,7 @@ static void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
 
 }
 
-static void* checked_realloc(void* p, size_t n, const char* ctx) {
+void* checked_realloc(void* p, size_t n, const char* ctx) {
 
 	void* nb = std::realloc(p, n);
 
@@ -1025,7 +1076,7 @@ static void* checked_realloc(void* p, size_t n, const char* ctx) {
 
 }
 
-static void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes, bool preserve_data = true) {
+void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes, bool preserve_data = true) {
 
 	size_t need = std::max(size_t{1}, min_bytes);
 
@@ -1060,7 +1111,7 @@ static void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes, bool pr
 
 }
 
-static void mpi_bcast_bytes(void* buf, size_t bytes, int root, MPI_Comm comm) {
+void mpi_bcast_bytes(void* buf, size_t bytes, int root, MPI_Comm comm) {
 
 	char* p = static_cast<char*>(buf);
 	size_t off = 0;
@@ -1075,7 +1126,7 @@ static void mpi_bcast_bytes(void* buf, size_t bytes, int root, MPI_Comm comm) {
 
 }
 
-static bool use_async_attach_mode(MalAttachExecMode mode = MAL_ATTACH_INHERIT) {
+inline bool use_async_attach_mode(MalAttachExecMode mode = MAL_ATTACH_INHERIT) {
 
 	MalAttachExecMode effective = mode;
 
@@ -1089,13 +1140,13 @@ static bool use_async_attach_mode(MalAttachExecMode mode = MAL_ATTACH_INHERIT) {
 
 }
 
-static void enqueue_attach_task(std::function<void()> fn) {
+void enqueue_attach_task(std::function<void()> fn) {
 
 	{
 
 		std::lock_guard lk(g.attach_mu);
 		g.attach_tasks.push_back(std::move(fn));
-		g.sync.attach_pending = true;
+		g.sync.attach_pending.store(true, std::memory_order_release);
 
 	}
 
@@ -1103,7 +1154,7 @@ static void enqueue_attach_task(std::function<void()> fn) {
 
 }
 
-static void dispatch_attach_task(std::function<void()> fn, bool async) {
+void dispatch_attach_task(std::function<void()> fn, bool async) {
 
 	if (!fn) {
 
@@ -1124,29 +1175,42 @@ static void dispatch_attach_task(std::function<void()> fn, bool async) {
 		bool done{false};
 	};
 
-	auto state = std::make_shared<SyncAttachState>();
+	struct SyncAttachTask {
 
-	enqueue_attach_task([fn = std::move(fn), state] () mutable {
+		std::function<void()> fn;
+		std::shared_ptr<SyncAttachState> state;
 
-		fn();
+		void operator()() {
 
-		{
+			if (fn) {
 
-			std::lock_guard lk(state->mu);
-			state->done = true;
+				fn();
+
+			}
+
+			{
+
+				std::lock_guard lk(state->mu);
+				state->done = true;
+
+			}
+
+			state->cv.notify_one();
 
 		}
 
-		state->cv.notify_one();
+	};
 
-	});
+	auto state = std::make_shared<SyncAttachState>();
+	enqueue_attach_task(SyncAttachTask{std::move(fn), state});
 
 	std::unique_lock lk(state->mu);
-	state->cv.wait(lk, [&] {
 
-		return state->done || g.sync.stop.load(std::memory_order_acquire);
+	while (!state->done && !g.sync.stop.load(std::memory_order_acquire)) {
 
-	});
+		state->cv.wait(lk);
+
+	}
 
 }
 
@@ -1154,15 +1218,28 @@ void mal_wait_attach_tasks() {
 
 	std::unique_lock lk(g.sync.mu);
 
-	g.sync.cv.wait(lk, [] {
+	while (g.sync.attach_pending.load(std::memory_order_acquire) && !g.sync.stop.load(std::memory_order_acquire)) {
 
-		return !g.sync.attach_pending.load(std::memory_order_acquire) || g.sync.stop.load(std::memory_order_acquire);
+		g.sync.cv.wait(lk);
 
-	});
+	}
 
 }
 
-static void run_attach_bcast_once_all(void* buf, size_t bytes, bool wait = true) {
+struct UniverseBroadcastTask {
+
+	void* buf{nullptr};
+	size_t bytes{0};
+
+	void operator()() const {
+
+		mpi_bcast_bytes(buf, bytes, 0, g.comm.universe);
+
+	}
+
+};
+
+void run_attach_bcast_once_all(void* buf, size_t bytes, bool wait = true) {
 
 	if (g.comm.universe == MPI_COMM_NULL || bytes == 0) {
 
@@ -1170,15 +1247,11 @@ static void run_attach_bcast_once_all(void* buf, size_t bytes, bool wait = true)
 
 	}
 
-	dispatch_attach_task([buf, bytes] {
-
-		mpi_bcast_bytes(buf, bytes, 0, g.comm.universe);
-
-	}, !wait);
+	dispatch_attach_task(UniverseBroadcastTask{buf, bytes}, !wait);
 
 }
 
-static bool has_work_or_stop() {
+inline bool has_work_or_stop() {
 
 	if (g.sync.stop.load(std::memory_order_acquire)) return true;
 	if (g.sync.attach_pending.load(std::memory_order_acquire)) return true;
@@ -1193,7 +1266,7 @@ static bool has_work_or_stop() {
 
 }
 
-static long total_range_iters(const std::vector<std::pair<long,long>>& ranges) {
+long total_range_iters(const std::vector<std::pair<long,long>>& ranges) {
 
 	long total = 0;
 
@@ -1207,7 +1280,7 @@ static long total_range_iters(const std::vector<std::pair<long,long>>& ranges) {
 
 }
 
-static std::vector<long> make_range_local_bases(const std::vector<std::pair<long,long>>& ranges) {
+std::vector<long> make_range_local_bases(const std::vector<std::pair<long,long>>& ranges) {
 
 	std::vector<long> bases;
 	bases.reserve(ranges.size());
@@ -1225,7 +1298,7 @@ static std::vector<long> make_range_local_bases(const std::vector<std::pair<long
 
 }
 
-static PendingActivation& ensure_pending_activation() {
+PendingActivation& ensure_pending_activation() {
 
 	if (!g.pending) {
 
@@ -1237,13 +1310,13 @@ static PendingActivation& ensure_pending_activation() {
 
 }
 
-static bool vec_is_fully_replicated(const MalVec& v) noexcept {
+inline bool vec_is_fully_replicated(const MalVec& v) noexcept {
 
 	return v.attach_policy != MAL_ATTACH_PARTITIONED;
 
 }
 
-static void configure_shared_active_vec(MalVec& v, size_t buf_need) {
+void configure_shared_active_vec(MalVec& v, size_t buf_need) {
 
 	if (v.buf && v.buf_bytes >= buf_need && v.local_n == v.total_N && v.done_n == 0 && v.buf_global_start == 0 && v.plan_origin_n == 0 && !v.cache_valid) {
 
@@ -1261,7 +1334,7 @@ static void configure_shared_active_vec(MalVec& v, size_t buf_need) {
 
 }
 
-static void release_shared_active_vec(MalVec& v) {
+void release_shared_active_vec(MalVec& v) {
 
 	if (v.buf) {
 
@@ -1285,7 +1358,7 @@ static void release_shared_active_vec(MalVec& v) {
 
 }
 
-static void set_partitioned_layout(MalVec& v, long local_n, long plan_origin_n, long buf_global_start) {
+void set_partitioned_layout(MalVec& v, long local_n, long plan_origin_n, long buf_global_start) {
 
 	v.local_n = local_n;
 	v.plan_origin_n = plan_origin_n;
@@ -1293,13 +1366,13 @@ static void set_partitioned_layout(MalVec& v, long local_n, long plan_origin_n, 
 
 }
 
-static long current_range_local_base(const MalFor& f) {
+inline long current_range_local_base(const MalFor& f) {
 
 	return (f.plan_idx < f.plan_local_bases.size()) ? f.plan_local_bases[f.plan_idx] : 0;
 
 }
 
-static void install_loop_plan(MalFor& f, const std::vector<std::pair<long,long>>& ranges, const std::vector<long>* local_bases = nullptr) {
+void install_loop_plan(MalFor& f, const std::vector<std::pair<long,long>>& ranges, const std::vector<long>* local_bases = nullptr) {
 
 	f.plan_ranges = ranges;
 	f.plan_local_bases.clear();
@@ -1329,7 +1402,7 @@ static void install_loop_plan(MalFor& f, const std::vector<std::pair<long,long>>
 
 }
 
-static bool set_read_only_cache_from_ranges(MalVec& v, const std::vector<std::pair<long,long>>& ranges, long local_off) {
+bool set_read_only_cache_from_ranges(MalVec& v, const std::vector<std::pair<long,long>>& ranges, long local_off) {
 
 	if (v.access_mode != MAL_ACCESS_READ_ONLY || ranges.empty()) {
 
@@ -1364,7 +1437,7 @@ static bool set_read_only_cache_from_ranges(MalVec& v, const std::vector<std::pa
 
 }
 
-static void refresh_inactive_read_only_cache(MalVec& v) {
+void refresh_inactive_read_only_cache(MalVec& v) {
 
 	if (v.access_mode != MAL_ACCESS_READ_ONLY) {
 
@@ -1397,9 +1470,9 @@ static void refresh_inactive_read_only_cache(MalVec& v) {
 
 }
 
-static void vec_scatter(MalVec& v, const void* root_data);
+void vec_scatter(MalVec& v, const void* root_data);
 
-static void advance_read_only_cache_after_progress(MalVec& v, long old_done, long new_done) {
+void advance_read_only_cache_after_progress(MalVec& v, long old_done, long new_done) {
 
 	if (v.access_mode != MAL_ACCESS_READ_ONLY || !v.cache_valid || new_done <= old_done) {
 
@@ -1419,7 +1492,7 @@ static void advance_read_only_cache_after_progress(MalVec& v, long old_done, lon
 
 }
 
-static StagedBuffer take_pending_vec_slice(int idx) {
+StagedBuffer take_pending_vec_slice(int idx) {
 
 	if (!g.pending || idx < 0 || idx >= (int)g.pending->vec_slices.size()) {
 
@@ -1433,9 +1506,13 @@ static StagedBuffer take_pending_vec_slice(int idx) {
 
 }
 
-static void async_broadcast_bytes(MPI_Comm comm, void* buf, size_t total_bytes, bool wait) {
+struct CommBroadcastTask {
 
-	dispatch_attach_task([comm, buf, total_bytes] {
+	MPI_Comm comm{MPI_COMM_NULL};
+	void* buf{nullptr};
+	size_t total_bytes{0};
+
+	void operator()() const {
 
 		if (comm == MPI_COMM_NULL || total_bytes == 0) {
 
@@ -1445,11 +1522,17 @@ static void async_broadcast_bytes(MPI_Comm comm, void* buf, size_t total_bytes, 
 
 		mpi_bcast_bytes(buf, total_bytes, 0, comm);
 
-	}, !wait);
+	}
+
+};
+
+void async_broadcast_bytes(MPI_Comm comm, void* buf, size_t total_bytes, bool wait) {
+
+	dispatch_attach_task(CommBroadcastTask{comm, buf, total_bytes}, !wait);
 
 }
 
-static void init_shared_buffer_from_root(void* buf, size_t total_bytes, bool is_root, const void* orig, const char* warn_msg) {
+void init_shared_buffer_from_root(void* buf, size_t total_bytes, bool is_root, const void* orig, const char* warn_msg) {
 
 	if (total_bytes == 0) {
 
@@ -1473,7 +1556,7 @@ static void init_shared_buffer_from_root(void* buf, size_t total_bytes, bool is_
 
 }
 
-static void maybe_release_root_attach_buffer(void* orig, size_t total_bytes, bool should_release) {
+void maybe_release_root_attach_buffer(void* orig, size_t total_bytes, bool should_release) {
 
 	if (should_release && orig) {
 
@@ -1483,7 +1566,7 @@ static void maybe_release_root_attach_buffer(void* orig, size_t total_bytes, boo
 
 }
 
-static SharedMat* get_shared_mat_or_abort(int idx) {
+SharedMat* get_shared_mat_or_abort(int idx) {
 
 	if (MAL_UNLIKELY(idx < 0 || idx >= (int)g.shared.size() || !g.shared[(size_t)idx])) {
 
@@ -1496,12 +1579,15 @@ static SharedMat* get_shared_mat_or_abort(int idx) {
 
 }
 
-static void run_partitioned_attach_scatter(MalVec& v, void* orig, int result_rank, size_t orig_bytes, MalAttachExecMode exec_mode) {
+struct PartitionedAttachScatterTask {
 
-	const int do_scatter = (orig && result_rank < 0) ? 1 : 0;
-	const bool wait = !use_async_attach_mode(exec_mode);
+	MalVec* vec{nullptr};
+	int do_scatter{0};
+	void* orig{nullptr};
+	int result_rank{-1};
+	size_t orig_bytes{0};
 
-	dispatch_attach_task([&v, do_scatter, orig, result_rank, orig_bytes] {
+	void operator()() const {
 
 		if (g.comm.active == MPI_COMM_NULL) {
 
@@ -1514,16 +1600,24 @@ static void run_partitioned_attach_scatter(MalVec& v, void* orig, int result_ran
 
 		if (op) {
 
-			vec_scatter(v, orig);
+			vec_scatter(*vec, orig);
 			maybe_release_root_attach_buffer(orig, orig_bytes, g.comm.u_rank == 0 && result_rank < 0);
 
 		}
 
-	}, !wait);
+	}
+
+};
+
+void run_partitioned_attach_scatter(MalVec& v, void* orig, int result_rank, size_t orig_bytes, MalAttachExecMode exec_mode) {
+
+	const int do_scatter = (orig && result_rank < 0) ? 1 : 0;
+	const bool wait = !use_async_attach_mode(exec_mode);
+	dispatch_attach_task(PartitionedAttachScatterTask{&v, do_scatter, orig, result_rank, orig_bytes}, !wait);
 
 }
 
-static void run_shared_active_attach_bcast(MalVec& v, void* orig, size_t total_bytes, MalAttachExecMode exec_mode) {
+void run_shared_active_attach_bcast(MalVec& v, void* orig, size_t total_bytes, MalAttachExecMode exec_mode) {
 
 	init_shared_buffer_from_root(v.buf, total_bytes, g.comm.a_rank == 0, orig, "MAL_ATTACH_SHARED_ACTIVE vector has null active-root pointer; broadcasting zero-initialized data");
 	async_broadcast_bytes(g.comm.active, v.buf, total_bytes, !use_async_attach_mode(exec_mode));
@@ -1531,7 +1625,7 @@ static void run_shared_active_attach_bcast(MalVec& v, void* orig, size_t total_b
 
 }
 
-static void run_shared_all_attach_bcast(void* buf, void* orig, size_t total_bytes, int result_rank, MalAttachExecMode exec_mode, const char* warn_msg) {
+void run_shared_all_attach_bcast(void* buf, void* orig, size_t total_bytes, int result_rank, MalAttachExecMode exec_mode, const char* warn_msg) {
 
 	init_shared_buffer_from_root(buf, total_bytes, g.comm.u_rank == 0, orig, warn_msg);
 	run_attach_bcast_once_all(buf, total_bytes, !use_async_attach_mode(exec_mode));
@@ -1539,7 +1633,7 @@ static void run_shared_all_attach_bcast(void* buf, void* orig, size_t total_byte
 
 }
 
-static void* acquire_or_broadcast_active_shared_mat(void* orig, size_t total_bytes, MalAttachExecMode exec_mode) {
+void* acquire_or_broadcast_active_shared_mat(void* orig, size_t total_bytes, MalAttachExecMode exec_mode) {
 
 	void* buf = (g.comm.a_rank == 0 && orig) ? orig : g_buffer_pool.acquire(total_bytes > 0 ? total_bytes : 1);
 	async_broadcast_bytes(g.comm.active, buf, total_bytes, !use_async_attach_mode(exec_mode));
@@ -1547,7 +1641,7 @@ static void* acquire_or_broadcast_active_shared_mat(void* orig, size_t total_byt
 
 }
 
-static std::vector<char> take_pending_acc_epoch_buf(size_t fallback_size) {
+std::vector<char> take_pending_acc_epoch_buf(size_t fallback_size) {
 
 	if (!g.pending || g.pending->next_acc >= g.pending->acc_epoch_bufs.size()) {
 
@@ -1559,7 +1653,7 @@ static std::vector<char> take_pending_acc_epoch_buf(size_t fallback_size) {
 
 }
 
-static StagedBuffer take_pending_shared_mat() {
+StagedBuffer take_pending_shared_mat() {
 
 	if (!g.pending || g.pending->next_shared >= g.pending->shared_mats.size()) {
 
@@ -1574,7 +1668,7 @@ static StagedBuffer take_pending_shared_mat() {
 
 }
 
-static void load_pending_ranges_into_loop(MalFor& f) {
+void load_pending_ranges_into_loop(MalFor& f) {
 
 	if (!g.pending || g.pending->ranges.empty()) {
 
@@ -1625,7 +1719,7 @@ static void load_pending_ranges_into_loop(MalFor& f) {
 }
 
 template<typename GetAcc, typename OnResult>
-static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
+void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 
 	if (n == 0) {
 
@@ -1658,7 +1752,6 @@ static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 	int ai = 0;
 
 	while (ai < n) {
-
 		int ae = ai + 1;
 		int esz = meta[ai].esz;
 
@@ -1709,43 +1802,29 @@ static void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 
 	}
 
-	static constexpr size_t kMaxTLBatchCap = 256 * 1024;
-
-	if (tl_send.capacity() > kMaxTLBatchCap) {
-
-		tl_send.shrink_to_fit();
-
-	}
-
-	if (tl_recv.capacity() > kMaxTLBatchCap) {
-
-		tl_recv.shrink_to_fit();
-
-	}
-
 }
 
-static void set_iter(MalFor& f, long v) {
+inline void set_iter(MalFor& f, long v) {
 
 	f.current = v;
 	*f.user_iter = v;
 
 }
 
-static void set_limit(MalFor& f, long v) {
+inline void set_limit(MalFor& f, long v) {
 
 	f.end = v;
 	*f.user_limit = v;
 
 }
 
-static void prime_range_start(MalFor& f) {
+inline void prime_range_start(MalFor& f) {
 
 	set_iter(f, f.start - 1);
 
 }
 
-static void sync_vec_mapping_for_current_range(MalFor& f) {
+void sync_vec_mapping_for_current_range(MalFor& f) {
 
 	for (MalVec* v : f.vecs) {
 
@@ -1768,7 +1847,7 @@ static void sync_vec_mapping_for_current_range(MalFor& f) {
 
 }
 
-static void append_done_segments(MalVec& v, const MalFor& f, long local_origin, long from_local, long to_local) {
+void append_done_segments(MalVec& v, const MalFor& f, long local_origin, long from_local, long to_local) {
 
 	if (MAL_UNLIKELY(to_local <= from_local)) {
 
@@ -1812,7 +1891,7 @@ static void append_done_segments(MalVec& v, const MalFor& f, long local_origin, 
 
 }
 
-static void freeze_loop_at_current(MalFor& f) {
+void freeze_loop_at_current(MalFor& f) {
 
 	long cur = *f.user_iter;
 
@@ -1826,7 +1905,7 @@ static void freeze_loop_at_current(MalFor& f) {
 
 }
 
-static void distribute(long total, int nprocs, int rank, long& start, long& end) noexcept {
+void distribute(long total, int nprocs, int rank, long& start, long& end) noexcept {
 
 	long base = total / nprocs;
 	long rem = total % nprocs;
@@ -1835,7 +1914,7 @@ static void distribute(long total, int nprocs, int rank, long& start, long& end)
 
 }
 
-static std::vector<long> build_partition_cuts(long total, int nprocs) {
+std::vector<long> build_partition_cuts(long total, int nprocs) {
 
 	const auto& w = g.lb.weights;
 	std::vector<long> cuts((size_t)std::max(0, nprocs) + 1, 0);
@@ -1884,7 +1963,7 @@ static std::vector<long> build_partition_cuts(long total, int nprocs) {
 
 }
 
-static void weighted_distribute(long total, int nprocs, int rank, long& vstart, long& vend) noexcept {
+void weighted_distribute(long total, int nprocs, int rank, long& vstart, long& vend) noexcept {
 
 	const auto cuts = build_partition_cuts(total, nprocs);
 
@@ -1901,7 +1980,7 @@ static void weighted_distribute(long total, int nprocs, int rank, long& vstart, 
 
 }
 
-static std::vector<int> make_displs(const std::vector<int>& counts) {
+std::vector<int> make_displs(const std::vector<int>& counts) {
 
 	std::vector<int> d(counts.size());
 	std::exclusive_scan(counts.begin(), counts.end(), d.begin(), 0);
@@ -2092,13 +2171,13 @@ MalForND mal_for_nd_begin(long* const* iter_vars, long* const* limit_vars, const
 
 }
 
-bool mal_for_nd_done(const MalForND& f) {
+inline bool mal_for_nd_done(const MalForND& f) {
 
 	return f.done || !f.base || f.flat >= f.flat_limit;
 
 }
 
-static void mal_for_nd_sync_limits(MalForND& f) {
+void mal_for_nd_sync_limits(MalForND& f) {
 
 	for (size_t d = 0; d < f.limit_vars.size() && d < f.limits.size(); d++) {
 
@@ -2112,7 +2191,7 @@ static void mal_for_nd_sync_limits(MalForND& f) {
 
 }
 
-static void mal_for_nd_set_iters_from_flat(MalForND& f, long flat_iter, bool for_post_check) {
+void mal_for_nd_set_iters_from_flat(MalForND& f, long flat_iter, bool for_post_check) {
 
 	if (f.spec.extents.empty() || flat_iter < 0) {
 
@@ -2152,7 +2231,7 @@ static void mal_for_nd_set_iters_from_flat(MalForND& f, long flat_iter, bool for
 
 }
 
-static void mal_for_nd_mark_done(MalForND& f) {
+void mal_for_nd_mark_done(MalForND& f) {
 
 	f.done = true;
 
@@ -2249,7 +2328,7 @@ void SharedMat::free_resources() {
 
 }
 
-static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::pair<long,long>>& remaining, std::vector<long>& offsets, long vstart, long vend) {
+std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::pair<long,long>>& remaining, std::vector<long>& offsets, long vstart, long vend) {
 
 	std::vector<std::pair<long,long>> out;
 	out.reserve(remaining.size());
@@ -2300,7 +2379,7 @@ static std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::
 
 }
 
-static bool vec_can_reuse_assigned_ranges(const MalVec& v, const std::vector<std::pair<long,long>>& assigned) {
+bool vec_can_reuse_assigned_ranges(const MalVec& v, const std::vector<std::pair<long,long>>& assigned) {
 
 	if (v.access_mode != MAL_ACCESS_READ_ONLY || !v.cache_valid) {
 
@@ -2331,7 +2410,7 @@ static bool vec_can_reuse_assigned_ranges(const MalVec& v, const std::vector<std
 
 }
 
-static bool vec_reuse_local_copy(MalVec& v, const std::vector<std::pair<long,long>>& assigned, long done_n) {
+bool vec_reuse_local_copy(MalVec& v, const std::vector<std::pair<long,long>>& assigned, long done_n) {
 
 	if (!vec_can_reuse_assigned_ranges(v, assigned)) {
 

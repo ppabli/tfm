@@ -2,20 +2,20 @@
 #include <algorithm>
 #include <cmath>
 #include <mpi.h>
-#include <unistd.h>
 #include "malleable.hpp"
+#include "example_utils.hpp"
 
 #define SPARSE_ROWS 3600
 #define SPARSE_COLS 4096
 #define SPARSE_MAX_ROW_NNZ 240
 
-static double x_val_for_col(int col) {
+double x_val_for_col(int col) {
 
 	return 1.0 + static_cast<double>(col % 9) * 0.075;
 
 }
 
-static int nnz_for_row(long row) {
+int nnz_for_row(long row) {
 
 	const long block = (row / 36) % 5;
 
@@ -53,13 +53,13 @@ static int nnz_for_row(long row) {
 
 }
 
-static int clamped_nnz_for_row(long row) {
+int clamped_nnz_for_row(long row) {
 
 	return std::min(nnz_for_row(row), SPARSE_MAX_ROW_NNZ);
 
 }
 
-static int stride_for_row(long row) {
+int stride_for_row(long row) {
 
 	int stride = 17 + static_cast<int>(row % 31);
 
@@ -73,25 +73,25 @@ static int stride_for_row(long row) {
 
 }
 
-static int seed_for_row(long row) {
+int seed_for_row(long row) {
 
 	return static_cast<int>((row * 59 + (row / 9) * 83 + 7) % SPARSE_COLS);
 
 }
 
-static int col_for(long row, int k) {
+int col_for(long row, int k) {
 
 	return (seed_for_row(row) + k * stride_for_row(row) + (k % 5) * 19) % SPARSE_COLS;
 
 }
 
-static double val_for(long row, int k) {
+double val_for(long row, int k) {
 
 	return 0.4 + static_cast<double>((row + k) % 21) * 0.11;
 
 }
 
-static long build_sparse_problem(int* row_nnz, int* col_idx, double* values, double* x) {
+long build_sparse_problem(int* row_nnz, int* col_idx, double* values, double* x) {
 
 	for (int c = 0; c < SPARSE_COLS; c++) {
 
@@ -160,6 +160,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 	long row, limit;
 	MalFor f = mal_for(SPARSE_ROWS, row, limit);
+	const useconds_t delay_scale_percent = sparse_delay_scale_percent();
 
 	mal_attach_mat(f, (void**)&row_nnz, sizeof(int), SPARSE_ROWS, 1, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&col_idx, sizeof(int), SPARSE_ROWS, SPARSE_MAX_ROW_NNZ, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
@@ -179,12 +180,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 		}
 
+		const int delay_ms = 4 + nnz / 2;
+		const useconds_t delay_us = (useconds_t)delay_ms * 1000u * delay_scale_percent / 100u;
 		y[row] = acc;
 
-		const int delay_ms = 4 + nnz / 2;
 		MAL_LOG(MAL_LOG_INFO, "[ITER] row=%ld nnz=%d delay=%dms y=%.6f", row, nnz, delay_ms, acc);
 
-		usleep(1000 * 1000 * 2);
+		usleep(delay_us);
 
 		mal_check_for(f);
 
@@ -229,11 +231,35 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 	}
 
-	if (row_nnz) std::free(row_nnz);
-	if (col_idx) std::free(col_idx);
-	if (values) std::free(values);
-	if (x) std::free(x);
-	if (y) std::free(y);
+	if (row_nnz) {
+
+		std::free(row_nnz);
+
+	}
+
+	if (col_idx) {
+
+		std::free(col_idx);
+
+	}
+
+	if (values) {
+
+		std::free(values);
+
+	}
+
+	if (x) {
+
+		std::free(x);
+
+	}
+
+	if (y) {
+
+		std::free(y);
+
+	}
 
 	return EXIT_SUCCESS;
 

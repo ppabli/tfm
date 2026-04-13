@@ -2,8 +2,8 @@
 #include <cstdio>
 #include <cmath>
 #include <mpi.h>
-#include <unistd.h>
 #include "malleable.hpp"
+#include "example_utils.hpp"
 
 #define MAL_TOTAL_POINTS 20
 
@@ -15,6 +15,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 	long i, limit;
 	MalFor f = mal_for(MAL_TOTAL_POINTS, i, limit);
+	const useconds_t delay_us = example_delay_us(200000);
 
 	long hits = 0;
 	mal_attach_acc(f, hits);
@@ -32,7 +33,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 		MAL_LOG(MAL_LOG_INFO, "[ITER] i=%ld hits_so_far=%ld", i, hits);
 
-		usleep(1000 * 1000 * 2);
+		usleep(delay_us);
 
 		mal_check_for(f);
 

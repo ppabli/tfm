@@ -3,14 +3,14 @@
 #include <cstring>
 #include <cmath>
 #include <mpi.h>
-#include <unistd.h>
 #include "malleable.hpp"
+#include "example_utils.hpp"
 
 #define M 12
 #define K 6
 #define N 4
 
-static void run_matvec() {
+void run_matvec() {
 
 	double *A = nullptr, *x = nullptr, *y = nullptr;
 
@@ -40,6 +40,7 @@ static void run_matvec() {
 
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
+	const useconds_t delay_us = example_delay_us(100000);
 
 	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
 	mal_attach_mat(f, (void**)&x, sizeof(double), 1, K, -1, MAL_ATTACH_SHARED_ACTIVE);
@@ -59,7 +60,7 @@ static void run_matvec() {
 
 		MAL_LOG(MAL_LOG_INFO, "[MV] y[%ld] = %.1f", i, acc);
 
-		usleep(500 * 1000);
+		usleep(delay_us);
 
 		mal_check_for(f);
 
@@ -101,7 +102,7 @@ static void run_matvec() {
 
 }
 
-static void run_matmul() {
+void run_matmul() {
 
 	double *A = nullptr, *B = nullptr, *C = nullptr;
 
@@ -136,6 +137,7 @@ static void run_matmul() {
 
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
+	const useconds_t delay_us = example_delay_us(100000);
 
 	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
 	mal_attach_mat(f, (void**)&B, sizeof(double), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
@@ -159,7 +161,7 @@ static void run_matmul() {
 
 		MAL_LOG(MAL_LOG_INFO, "[MM] C[%ld, 0..%d] computed, C[%ld,0]=%.1f", i, N-1, i, C[i * N]);
 
-		usleep(500 * 1000);
+		usleep(delay_us);
 
 		mal_check_for(f);
 

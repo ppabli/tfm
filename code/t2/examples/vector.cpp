@@ -1,8 +1,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mpi.h>
-#include <unistd.h>
 #include "malleable.hpp"
+#include "example_utils.hpp"
 
 #define MAL_N 20
 
@@ -45,6 +45,8 @@ int main(int argc, char* argv[]) {
 		mal_attach_vec(nd, (void**)&B, sizeof(double), MAL_N, -1);
 		mal_attach_vec(nd, (void**)&C, sizeof(double), MAL_N,  0);
 
+
+		const useconds_t delay_us = example_delay_us(200000);
 		for (; i < limit_rows; i++) {
 
 			for (; j < limit_cols; j++) {
@@ -53,8 +55,7 @@ int main(int argc, char* argv[]) {
 				C[idx] = A[idx] + B[idx];
 
 				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", idx, A[idx], B[idx], C[idx]);
-
-				usleep(1000 * 1000 * 2);
+				usleep(delay_us);
 
 				mal_check_for(nd);
 
@@ -71,14 +72,14 @@ int main(int argc, char* argv[]) {
 		mal_attach_vec(f, (void**)&A, sizeof(double), MAL_N, -1);
 		mal_attach_vec(f, (void**)&B, sizeof(double), MAL_N, -1);
 		mal_attach_vec(f, (void**)&C, sizeof(double), MAL_N,  0);
+		const useconds_t delay_us = example_delay_us(200000);
 
 		for (; i < limit; i++) {
 
 			C[i] = A[i] + B[i];
 
 			MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
-
-			usleep(1000 * 1000 * 2);
+			usleep(delay_us);
 
 			mal_check_for(f);
 
