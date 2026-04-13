@@ -4,47 +4,49 @@
 #include "malleable.hpp"
 #include "example_utils.hpp"
 
-#define MAL_N 20
-
 int main(int argc, char* argv[]) {
 
 	mal_init();
+
+	const long mal_n         = parse_arg_long(argc, argv, "n", 20);
+	const long collapse_rows = parse_arg_long(argc, argv, "rows", 4);
+	const long collapse_cols = parse_arg_long(argc, argv, "cols", 5);
+
+	bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
+	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
 
 	double *A = nullptr, *B = nullptr, *C = nullptr;
 
 	if (mal_rank() == 0) {
 
-		A = static_cast<double*>(std::malloc(MAL_N * sizeof(double)));
-		B = static_cast<double*>(std::malloc(MAL_N * sizeof(double)));
-		C = static_cast<double*>(std::malloc(MAL_N * sizeof(double)));
+		A = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
+		B = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
+		C = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
 
-		for (int k = 0; k < MAL_N; k++) {
+		for (long k = 0; k < total_n; k++) {
 
 			A[k] = static_cast<double>(k + 1);
-			B[k] = static_cast<double>(MAL_N - k);
+			B[k] = static_cast<double>(total_n - k);
 
 		}
 
 	}
-
-	bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
 
 	if (use_collapse) {
 
 		long i, limit_rows, j, limit_cols;
 
 		const long starts[2] = {0, 0};
-		const long limits2d[2] = {4, 5};
+		const long limits2d[2] = {collapse_rows, collapse_cols};
 
 		long* iters[2] = {&i, &j};
 		long* loop_limits[2] = {&limit_rows, &limit_cols};
 
 		MalForND nd = mal_for_nd_begin(iters, loop_limits, starts, limits2d, 2);
 
-		mal_attach_vec(nd, (void**)&A, sizeof(double), MAL_N, -1);
-		mal_attach_vec(nd, (void**)&B, sizeof(double), MAL_N, -1);
-		mal_attach_vec(nd, (void**)&C, sizeof(double), MAL_N,  0);
-
+		mal_attach_vec(nd, (void**)&A, sizeof(double), total_n, -1);
+		mal_attach_vec(nd, (void**)&B, sizeof(double), total_n, -1);
+		mal_attach_vec(nd, (void**)&C, sizeof(double), total_n,  0);
 
 		const useconds_t delay_us = example_delay_us(200000);
 		for (; i < limit_rows; i++) {
@@ -67,11 +69,11 @@ int main(int argc, char* argv[]) {
 
 		long i, limit;
 
-		MalFor f = mal_for(MAL_N, i, limit);
+		MalFor f = mal_for(mal_n, i, limit);
 
-		mal_attach_vec(f, (void**)&A, sizeof(double), MAL_N, -1);
-		mal_attach_vec(f, (void**)&B, sizeof(double), MAL_N, -1);
-		mal_attach_vec(f, (void**)&C, sizeof(double), MAL_N,  0);
+		mal_attach_vec(f, (void**)&A, sizeof(double), mal_n, -1);
+		mal_attach_vec(f, (void**)&B, sizeof(double), mal_n, -1);
+		mal_attach_vec(f, (void**)&C, sizeof(double), mal_n,  0);
 		const useconds_t delay_us = example_delay_us(200000);
 
 		for (; i < limit; i++) {
@@ -93,9 +95,9 @@ int main(int argc, char* argv[]) {
 
 		int errors = 0;
 
-		for (int k = 0; k < MAL_N; k++) {
+		for (long k = 0; k < total_n; k++) {
 
-			if (C[k] != static_cast<double>(MAL_N + 1)) {
+			if (C[k] != static_cast<double>(total_n + 1)) {
 
 				errors++;
 				break;

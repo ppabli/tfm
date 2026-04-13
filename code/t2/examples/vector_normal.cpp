@@ -7,10 +7,6 @@
 #include <mpi.h>
 #include "example_utils.hpp"
 
-#define MAL_N 20
-#define COLLAPSE_ROWS 4
-#define COLLAPSE_COLS 5
-
 struct BlockRange {
 	long start;
 	long count;
@@ -51,16 +47,22 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-	double* A = static_cast<double*>(std::malloc(MAL_N * sizeof(double)));
-	double* B = static_cast<double*>(std::malloc(MAL_N * sizeof(double)));
-	double* C = (world_rank == 0) ? static_cast<double*>(std::malloc(MAL_N * sizeof(double))) : nullptr;
+	const long mal_n         = parse_arg_long(argc, argv, "n", 20);
+	const long collapse_rows = parse_arg_long(argc, argv, "rows", 4);
+	const long collapse_cols = parse_arg_long(argc, argv, "cols", 5);
+	const bool use_collapse  = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
+	const long total_n       = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
+
+	double* A = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
+	double* B = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
+	double* C = (world_rank == 0) ? static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double))) : nullptr;
 
 	if (world_rank == 0) {
 
-		for (int k = 0; k < MAL_N; k++) {
+		for (long k = 0; k < total_n; k++) {
 
 			A[k] = static_cast<double>(k + 1);
-			B[k] = static_cast<double>(MAL_N - k);
+			B[k] = static_cast<double>(total_n - k);
 
 		}
 
@@ -69,11 +71,10 @@ int main(int argc, char* argv[]) {
 	MPI_Barrier(MPI_COMM_WORLD);
 	const double t0 = MPI_Wtime();
 
-	MPI_Bcast(A, MAL_N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-	MPI_Bcast(B, MAL_N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Bcast(A, static_cast<int>(total_n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Bcast(B, static_cast<int>(total_n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-	const bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
-	const BlockRange range = block_range(MAL_N, world_rank, world_size);
+	const BlockRange range = block_range(total_n, world_rank, world_size);
 	std::vector<double> local_c(static_cast<size_t>(range.count));
 	const useconds_t delay_us = example_delay_us(200000);
 
@@ -82,11 +83,11 @@ int main(int argc, char* argv[]) {
 		const long flat = range.start + local_i;
 		long idx = flat;
 
-		if (use_collapse && COLLAPSE_ROWS * COLLAPSE_COLS == MAL_N) {
+		if (use_collapse && collapse_rows * collapse_cols == total_n) {
 
-			const long row = flat / COLLAPSE_COLS;
-			const long col = flat % COLLAPSE_COLS;
-			idx = row * COLLAPSE_COLS + col;
+			const long row = flat / collapse_cols;
+			const long col = flat % collapse_cols;
+			idx = row * collapse_cols + col;
 
 		}
 
@@ -99,7 +100,7 @@ int main(int argc, char* argv[]) {
 	std::vector<int> recv_displs;
 	if (world_rank == 0) {
 
-		build_gatherv_layout(MAL_N, world_size, recv_counts, recv_displs);
+		build_gatherv_layout(total_n, world_size, recv_counts, recv_displs);
 
 	}
 
@@ -111,9 +112,9 @@ int main(int argc, char* argv[]) {
 	if (world_rank == 0) {
 
 		int errors = 0;
-		for (int k = 0; k < MAL_N; k++) {
+		for (long k = 0; k < total_n; k++) {
 
-			if (std::fabs(C[k] - static_cast<double>(MAL_N + 1)) > 1e-9) {
+			if (std::fabs(C[k] - static_cast<double>(total_n + 1)) > 1e-9) {
 
 				errors++;
 				break;

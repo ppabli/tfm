@@ -6,19 +6,15 @@
 #include "malleable.hpp"
 #include "example_utils.hpp"
 
-#define M 12
-#define K 6
-#define N 4
-
-void run_matvec() {
+void run_matvec(int M, int K) {
 
 	double *A = nullptr, *x = nullptr, *y = nullptr;
 
 	if (mal_rank() == 0) {
 
-		A = static_cast<double*>(std::malloc(M * K * sizeof(double)));
-		x = static_cast<double*>(std::malloc(K * sizeof(double)));
-		y = static_cast<double*>(std::malloc(M * sizeof(double)));
+		A = static_cast<double*>(std::malloc(static_cast<size_t>(M * K) * sizeof(double)));
+		x = static_cast<double*>(std::malloc(static_cast<size_t>(K) * sizeof(double)));
+		y = static_cast<double*>(std::malloc(static_cast<size_t>(M) * sizeof(double)));
 
 		for (int r = 0; r < M; r++) {
 
@@ -102,15 +98,15 @@ void run_matvec() {
 
 }
 
-void run_matmul() {
+void run_matmul(int M, int K, int N) {
 
 	double *A = nullptr, *B = nullptr, *C = nullptr;
 
 	if (mal_rank() == 0) {
 
-		A = static_cast<double*>(std::malloc(M * K * sizeof(double)));
-		B = static_cast<double*>(std::malloc(K * N * sizeof(double)));
-		C = static_cast<double*>(std::malloc(M * N * sizeof(double)));
+		A = static_cast<double*>(std::malloc(static_cast<size_t>(M * K) * sizeof(double)));
+		B = static_cast<double*>(std::malloc(static_cast<size_t>(K * N) * sizeof(double)));
+		C = static_cast<double*>(std::malloc(static_cast<size_t>(M * N) * sizeof(double)));
 
 		for (int r = 0; r < M; r++) {
 
@@ -125,7 +121,6 @@ void run_matmul() {
 		for (int r = 0; r < K; r++) {
 
 			for (int c = 0; c < N; c++) {
-
 
 				B[r * N + c] = 1.0;
 
@@ -203,15 +198,19 @@ int main(int argc, char* argv[]) {
 
 	mal_init();
 
+	const int M = static_cast<int>(parse_arg_long(argc, argv, "m", 12));
+	const int K = static_cast<int>(parse_arg_long(argc, argv, "k", 6));
+	const int N = static_cast<int>(parse_arg_long(argc, argv, "n", 4));
+
 	bool do_mv = (argc > 1 && std::strcmp(argv[1], "mv") == 0);
 
 	if (do_mv) {
 
-		run_matvec();
+		run_matvec(M, K);
 
 	} else {
 
-		run_matmul();
+		run_matmul(M, K, N);
 
 	}
 

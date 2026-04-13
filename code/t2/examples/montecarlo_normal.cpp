@@ -5,8 +5,6 @@
 #include <mpi.h>
 #include "example_utils.hpp"
 
-#define MAL_TOTAL_POINTS 20
-
 struct BlockRange {
 	long start;
 	long count;
@@ -32,8 +30,9 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
+	const long total_points = parse_arg_long(argc, argv, "n", 20);
 	unsigned int seed = static_cast<unsigned int>(world_rank);
-	const BlockRange range = block_range(MAL_TOTAL_POINTS, world_rank, world_size);
+	const BlockRange range = block_range(total_points, world_rank, world_size);
 	const useconds_t delay_us = example_delay_us(200000);
 
 	MPI_Barrier(MPI_COMM_WORLD);
@@ -63,8 +62,8 @@ int main(int argc, char* argv[]) {
 
 	if (world_rank == 0) {
 
-		const double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(MAL_TOTAL_POINTS);
-		std::printf("[RESULT] montecarlo OK total_points=%d  hits=%ld  pi~=%.6f  error=%.2e\n", MAL_TOTAL_POINTS, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
+		const double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(total_points);
+		std::printf("[RESULT] montecarlo OK total_points=%ld  hits=%ld  pi~=%.6f  error=%.2e\n", total_points, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
 		std::printf("[TIME] montecarlo normal mpi np=%d seconds=%.6f\n", world_size, t1 - t0);
 
 	}

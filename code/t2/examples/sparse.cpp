@@ -5,9 +5,9 @@
 #include "malleable.hpp"
 #include "example_utils.hpp"
 
-#define SPARSE_ROWS 3600
-#define SPARSE_COLS 4096
-#define SPARSE_MAX_ROW_NNZ 240
+static int SPARSE_ROWS      = 3600;
+static int SPARSE_COLS      = 4096;
+static int SPARSE_MAX_ROW_NNZ = 240;
 
 double x_val_for_col(int col) {
 
@@ -132,7 +132,11 @@ long build_sparse_problem(int* row_nnz, int* col_idx, double* values, double* x)
 
 }
 
-int main(int /*argc*/, char* /*argv*/[]) {
+int main(int argc, char* argv[]) {
+
+	SPARSE_ROWS       = static_cast<int>(parse_arg_long(argc, argv, "rows",    3600));
+	SPARSE_COLS       = static_cast<int>(parse_arg_long(argc, argv, "cols",    4096));
+	SPARSE_MAX_ROW_NNZ = static_cast<int>(parse_arg_long(argc, argv, "max-nnz", 240));
 
 	mal_init(MAL_RESIZE_POLICY_AUTO);
 
@@ -146,11 +150,11 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 	if (mal_rank() == 0) {
 
-		row_nnz = static_cast<int*>(std::malloc(SPARSE_ROWS * sizeof(int)));
-		col_idx = static_cast<int*>(std::malloc(SPARSE_ROWS * SPARSE_MAX_ROW_NNZ * sizeof(int)));
-		values = static_cast<double*>(std::malloc(SPARSE_ROWS * SPARSE_MAX_ROW_NNZ * sizeof(double)));
-		x = static_cast<double*>(std::malloc(SPARSE_COLS * sizeof(double)));
-		y = static_cast<double*>(std::malloc(SPARSE_ROWS * sizeof(double)));
+		row_nnz = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(int)));
+		col_idx = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(int)));
+		values = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(double)));
+		x = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_COLS) * sizeof(double)));
+		y = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(double)));
 
 		total_nnz = build_sparse_problem(row_nnz, col_idx, values, x);
 

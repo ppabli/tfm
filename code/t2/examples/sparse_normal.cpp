@@ -6,9 +6,9 @@
 #include <mpi.h>
 #include "example_utils.hpp"
 
-#define SPARSE_ROWS 3600
-#define SPARSE_COLS 4096
-#define SPARSE_MAX_ROW_NNZ 240
+static int SPARSE_ROWS      = 3600;
+static int SPARSE_COLS      = 4096;
+static int SPARSE_MAX_ROW_NNZ = 240;
 
 struct BlockRange {
 	long start;
@@ -164,16 +164,20 @@ int main(int argc, char* argv[]) {
 
 	MPI_Init(&argc, &argv);
 
+	SPARSE_ROWS       = static_cast<int>(parse_arg_long(argc, argv, "rows",    3600));
+	SPARSE_COLS       = static_cast<int>(parse_arg_long(argc, argv, "cols",    4096));
+	SPARSE_MAX_ROW_NNZ = static_cast<int>(parse_arg_long(argc, argv, "max-nnz", 240));
+
 	int world_rank = 0;
 	int world_size = 1;
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-	int* row_nnz = static_cast<int*>(std::malloc(SPARSE_ROWS * sizeof(int)));
-	int* col_idx = static_cast<int*>(std::malloc(SPARSE_ROWS * SPARSE_MAX_ROW_NNZ * sizeof(int)));
-	double* values = static_cast<double*>(std::malloc(SPARSE_ROWS * SPARSE_MAX_ROW_NNZ * sizeof(double)));
-	double* x = static_cast<double*>(std::malloc(SPARSE_COLS * sizeof(double)));
-	double* y = (world_rank == 0) ? static_cast<double*>(std::malloc(SPARSE_ROWS * sizeof(double))) : nullptr;
+	int* row_nnz = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(int)));
+	int* col_idx = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(int)));
+	double* values = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(double)));
+	double* x = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_COLS) * sizeof(double)));
+	double* y = (world_rank == 0) ? static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(double))) : nullptr;
 
 	long total_nnz = 0;
 	if (world_rank == 0) {

@@ -5,16 +5,15 @@
 #include "malleable.hpp"
 #include "example_utils.hpp"
 
-#define MAL_TOTAL_POINTS 20
-
-int main(int /*argc*/, char* /*argv*/[]) {
+int main(int argc, char* argv[]) {
 
 	mal_init();
 
+	const long total_points = parse_arg_long(argc, argv, "n", 20);
 	unsigned int seed = static_cast<unsigned int>(mal_rank());
 
 	long i, limit;
-	MalFor f = mal_for(MAL_TOTAL_POINTS, i, limit);
+	MalFor f = mal_for(total_points, i, limit);
 	const useconds_t delay_us = example_delay_us(200000);
 
 	long hits = 0;
@@ -43,9 +42,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
 	if (mal_rank() == 0) {
 
-		double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(MAL_TOTAL_POINTS);
+		double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(total_points);
 
-		MAL_LOG(MAL_LOG_INFO, "[RESULT] montecarlo OK total_points=%d  hits=%ld  pi~=%.6f  error=%.2e", MAL_TOTAL_POINTS, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
+		MAL_LOG(MAL_LOG_INFO, "[RESULT] montecarlo OK total_points=%ld  hits=%ld  pi~=%.6f  error=%.2e", total_points, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
 
 	}
 

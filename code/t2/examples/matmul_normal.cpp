@@ -7,10 +7,6 @@
 #include <mpi.h>
 #include "example_utils.hpp"
 
-#define M 12
-#define K 6
-#define N 4
-
 struct BlockRange {
 	long start;
 	long count;
@@ -42,11 +38,11 @@ void build_gatherv_layout(long total_rows, int row_width, int world_size, std::v
 
 }
 
-int run_matvec(int world_rank, int world_size, double* elapsed_out) {
+int run_matvec(int world_rank, int world_size, int M, int K, double* elapsed_out) {
 
-	double* A = static_cast<double*>(std::malloc(M * K * sizeof(double)));
-	double* x = static_cast<double*>(std::malloc(K * sizeof(double)));
-	double* y = (world_rank == 0) ? static_cast<double*>(std::malloc(M * sizeof(double))) : nullptr;
+	double* A = static_cast<double*>(std::malloc(static_cast<size_t>(M * K) * sizeof(double)));
+	double* x = static_cast<double*>(std::malloc(static_cast<size_t>(K) * sizeof(double)));
+	double* y = (world_rank == 0) ? static_cast<double*>(std::malloc(static_cast<size_t>(M) * sizeof(double))) : nullptr;
 
 	if (world_rank == 0) {
 
@@ -147,11 +143,11 @@ int run_matvec(int world_rank, int world_size, double* elapsed_out) {
 
 }
 
-int run_matmul(int world_rank, int world_size, double* elapsed_out) {
+int run_matmul(int world_rank, int world_size, int M, int K, int N, double* elapsed_out) {
 
-	double* A = static_cast<double*>(std::malloc(M * K * sizeof(double)));
-	double* B = static_cast<double*>(std::malloc(K * N * sizeof(double)));
-	double* C = (world_rank == 0) ? static_cast<double*>(std::malloc(M * N * sizeof(double))) : nullptr;
+	double* A = static_cast<double*>(std::malloc(static_cast<size_t>(M * K) * sizeof(double)));
+	double* B = static_cast<double*>(std::malloc(static_cast<size_t>(K * N) * sizeof(double)));
+	double* C = (world_rank == 0) ? static_cast<double*>(std::malloc(static_cast<size_t>(M * N) * sizeof(double))) : nullptr;
 
 	if (world_rank == 0) {
 
@@ -268,16 +264,20 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
+	const int M = static_cast<int>(parse_arg_long(argc, argv, "m", 12));
+	const int K = static_cast<int>(parse_arg_long(argc, argv, "k", 6));
+	const int N = static_cast<int>(parse_arg_long(argc, argv, "n", 4));
+
 	const bool do_mv = (argc > 1 && std::strcmp(argv[1], "mv") == 0);
 	double elapsed = 0.0;
 
 	if (do_mv) {
 
-		run_matvec(world_rank, world_size, &elapsed);
+		run_matvec(world_rank, world_size, M, K, &elapsed);
 
 	} else {
 
-		run_matmul(world_rank, world_size, &elapsed);
+		run_matmul(world_rank, world_size, M, K, N, &elapsed);
 
 	}
 

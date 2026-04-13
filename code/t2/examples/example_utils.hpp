@@ -3,6 +3,34 @@
 #include <cstdlib>
 #include <unistd.h>
 
+[[maybe_unused]] inline long parse_arg_long(int argc, char** argv, const char* key, long default_val) {
+
+	for (int i = 1; i < argc; i++) {
+
+		const char* arg = argv[i];
+
+		if (arg[0] != '-' || arg[1] != '-') continue;
+
+		const char* p = arg + 2;
+		const char* q = key;
+
+		while (*q && *p == *q) { p++; q++; }
+
+		if (*q == '\0' && *p == '=') {
+
+			char* end = nullptr;
+			long v = std::strtol(p + 1, &end, 10);
+
+			if (end != p + 1) return v;
+
+		}
+
+	}
+
+	return default_val;
+
+}
+
 [[maybe_unused]] inline useconds_t parse_env_uint(const char* var, useconds_t default_val) {
 
 	const char* env = std::getenv(var);
