@@ -15,6 +15,7 @@ int main(int argc, char* argv[]) {
 	long i, limit;
 	MalFor f = mal_for(total_points, i, limit);
 	const useconds_t delay_us = example_delay_us(200000);
+	const double t0 = MPI_Wtime();
 
 	long hits = 0;
 	mal_attach_acc(f, hits);
@@ -30,7 +31,9 @@ int main(int argc, char* argv[]) {
 
 		}
 
+		#if !BENCH_CSV
 		MAL_LOG(MAL_LOG_INFO, "[ITER] i=%ld hits_so_far=%ld", i, hits);
+		#endif
 
 		usleep(delay_us);
 
@@ -39,12 +42,25 @@ int main(int argc, char* argv[]) {
 	}
 
 	mal_finalize();
+	const double compute_seconds = MPI_Wtime() - t0;
+
+	#if !BENCH_CSV
+	(void)compute_seconds;
+	#endif
 
 	if (mal_rank() == 0) {
 
-		double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(total_points);
+		#if BENCH_CSV
 
-		MAL_LOG(MAL_LOG_INFO, "[RESULT] montecarlo OK total_points=%ld  hits=%ld  pi~=%.6f  error=%.2e", total_points, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
+			print_bench_csv("montecarlo", "malleable", "std", mal_size(), total_points, compute_seconds, 0);
+
+		#else
+
+			double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(total_points);
+
+			MAL_LOG(MAL_LOG_INFO, "[RESULT] montecarlo OK total_points=%ld hits=%ld pi~=%.6f error=%.2e", total_points, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
+
+		#endif
 
 	}
 

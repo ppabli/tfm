@@ -10,52 +10,12 @@
 #include <utility>
 #include <vector>
 
-#ifndef MAL_INITIAL_SIZE
-
-	#define MAL_INITIAL_SIZE INT_MAX
-
-#endif
-
-#ifndef MAL_EPOCH_INTERVAL_MS
-
-	#define MAL_EPOCH_INTERVAL_MS 3000
-
-#endif
-
-#ifndef MAL_LOG_LEVEL
-
-	#define MAL_LOG_LEVEL MAL_LOG_INFO
-
-#endif
-
-#ifndef MAL_AFFINITY_ENABLED
-
-	#define MAL_AFFINITY_ENABLED 1
-
-#endif
-
-#ifndef MAL_MAIN_CORE_DEFAULT
-
-	#define MAL_MAIN_CORE_DEFAULT -1
-
-#endif
-
-#ifndef MAL_WORKER_CORE_DEFAULT
-
-	#define MAL_WORKER_CORE_DEFAULT -1
-#endif
-
-#ifndef MAL_EPOCH_CHANGE_MODE
-
-	#define MAL_EPOCH_CHANGE_MODE 0
-
-#endif
-
 #define MAL_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define MAL_LIKELY(x) __builtin_expect(!!(x), 1)
 #define MAL_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 int mal_rank();
+int mal_size();
 
 enum MalLogLevel {
 	MAL_LOG_DEBUG,
@@ -68,8 +28,11 @@ const char* mal_log_level_name(MalLogLevel level);
 const char* mal_log_level_color(MalLogLevel level);
 const char* mal_log_reset_color();
 
-#define MAL_LOG(level, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-6s][R%d] | " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
-#define MAL_LOG_L(level, tag, fmt, ...) do { if ((int)(level) >= (int)(MAL_LOG_LEVEL)) printf("%s[%8.3f][%-6s][%-6s][R%d] | " fmt "%s\n", mal_log_level_color((level)), MPI_Wtime(), mal_log_level_name((level)), (tag), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+double mal_log_time_s();
+bool mal_should_log(MalLogLevel level);
+
+#define MAL_LOG(level, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("%s[%8.3f][%-6s][R%d] | " fmt "%s\n", mal_log_level_color(_mal_level), mal_log_time_s(), mal_log_level_name(_mal_level), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+#define MAL_LOG_L(level, tag, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("%s[%8.3f][%-6s][%-6s][R%d] | " fmt "%s\n", mal_log_level_color(_mal_level), mal_log_time_s(), mal_log_level_name(_mal_level), (tag), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
 
 struct MalVec;
 struct MalAcc;

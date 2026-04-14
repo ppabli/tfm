@@ -37,6 +37,7 @@ void run_matvec(int M, int K) {
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
 	const useconds_t delay_us = example_delay_us(100000);
+	const double t0 = MPI_Wtime();
 
 	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
 	mal_attach_mat(f, (void**)&x, sizeof(double), 1, K, -1, MAL_ATTACH_SHARED_ACTIVE);
@@ -54,7 +55,9 @@ void run_matvec(int M, int K) {
 
 		y[i] = acc;
 
+		#if !BENCH_CSV
 		MAL_LOG(MAL_LOG_INFO, "[MV] y[%ld] = %.1f", i, acc);
+		#endif
 
 		usleep(delay_us);
 
@@ -63,6 +66,11 @@ void run_matvec(int M, int K) {
 	}
 
 	mal_finalize();
+	const double compute_seconds = MPI_Wtime() - t0;
+
+	#if !BENCH_CSV
+	(void)compute_seconds;
+	#endif
 
 	if (mal_rank() == 0) {
 
@@ -88,7 +96,15 @@ void run_matvec(int M, int K) {
 
 		}
 
-		MAL_LOG(MAL_LOG_INFO, "[RESULT] mat-vec %s (%d errors)", errors == 0 ? "OK" : "WRONG", errors);
+		#if BENCH_CSV
+
+			print_bench_csv("matmul", "malleable", "mv", mal_size(), M, compute_seconds, errors);
+
+		#else
+
+			MAL_LOG(MAL_LOG_INFO, "[RESULT] mat-vec %s (%d errors)", errors == 0 ? "OK" : "WRONG", errors);
+
+		#endif
 
 		std::free(y);
 
@@ -133,6 +149,7 @@ void run_matmul(int M, int K, int N) {
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
 	const useconds_t delay_us = example_delay_us(100000);
+	const double t0 = MPI_Wtime();
 
 	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
 	mal_attach_mat(f, (void**)&B, sizeof(double), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
@@ -154,7 +171,9 @@ void run_matmul(int M, int K, int N) {
 
 		}
 
+		#if !BENCH_CSV
 		MAL_LOG(MAL_LOG_INFO, "[MM] C[%ld, 0..%d] computed, C[%ld,0]=%.1f", i, N-1, i, C[i * N]);
+		#endif
 
 		usleep(delay_us);
 
@@ -163,6 +182,11 @@ void run_matmul(int M, int K, int N) {
 	}
 
 	mal_finalize();
+	const double compute_seconds = MPI_Wtime() - t0;
+
+	#if !BENCH_CSV
+	(void)compute_seconds;
+	#endif
 
 	if (mal_rank() == 0) {
 
@@ -184,7 +208,15 @@ void run_matmul(int M, int K, int N) {
 
 		}
 
-		MAL_LOG(MAL_LOG_INFO, "[RESULT] mat-mat %s (%d errors)", errors == 0 ? "OK" : "WRONG", errors);
+		#if BENCH_CSV
+
+			print_bench_csv("matmul", "malleable", "mm", mal_size(), static_cast<long>(M) * static_cast<long>(N), compute_seconds, errors);
+
+		#else
+
+			MAL_LOG(MAL_LOG_INFO, "[RESULT] mat-mat %s (%d errors)", errors == 0 ? "OK" : "WRONG", errors);
+
+		#endif
 
 		std::free(C);
 

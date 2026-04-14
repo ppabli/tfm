@@ -5,8 +5,8 @@
 #include "malleable.hpp"
 #include "example_utils.hpp"
 
-static int SPARSE_ROWS      = 3600;
-static int SPARSE_COLS      = 4096;
+static int SPARSE_ROWS = 3600;
+static int SPARSE_COLS = 4096;
 static int SPARSE_MAX_ROW_NNZ = 240;
 
 double x_val_for_col(int col) {
@@ -134,8 +134,8 @@ long build_sparse_problem(int* row_nnz, int* col_idx, double* values, double* x)
 
 int main(int argc, char* argv[]) {
 
-	SPARSE_ROWS       = static_cast<int>(parse_arg_long(argc, argv, "rows",    3600));
-	SPARSE_COLS       = static_cast<int>(parse_arg_long(argc, argv, "cols",    4096));
+	SPARSE_ROWS = static_cast<int>(parse_arg_long(argc, argv, "rows", 3600));
+	SPARSE_COLS = static_cast<int>(parse_arg_long(argc, argv, "cols", 4096));
 	SPARSE_MAX_ROW_NNZ = static_cast<int>(parse_arg_long(argc, argv, "max-nnz", 240));
 
 	mal_init(MAL_RESIZE_POLICY_AUTO);
@@ -158,7 +158,13 @@ int main(int argc, char* argv[]) {
 
 		total_nnz = build_sparse_problem(row_nnz, col_idx, values, x);
 
+		#if BENCH_CSV
+		(void)total_nnz;
+		#endif
+
+		#if !BENCH_CSV
 		MAL_LOG(MAL_LOG_INFO, "[SETUP] sparse rows=%d cols=%d max_row_nnz=%d nnz=%ld mode=auto", SPARSE_ROWS, SPARSE_COLS, SPARSE_MAX_ROW_NNZ, total_nnz);
+		#endif
 
 	}
 
@@ -171,6 +177,7 @@ int main(int argc, char* argv[]) {
 	mal_attach_mat(f, (void**)&values, sizeof(double), SPARSE_ROWS, SPARSE_MAX_ROW_NNZ, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&x, sizeof(double), 1, SPARSE_COLS, -1, MAL_ATTACH_SHARED_ACTIVE, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&y, sizeof(double), SPARSE_ROWS, 1, 0, MAL_ATTACH_PARTITIONED);
+	const double t0 = MPI_Wtime();
 
 	for (; row < limit; row++) {
 
@@ -188,7 +195,9 @@ int main(int argc, char* argv[]) {
 		const useconds_t delay_us = (useconds_t)delay_ms * 1000u * delay_scale_percent / 100u;
 		y[row] = acc;
 
+		#if !BENCH_CSV
 		MAL_LOG(MAL_LOG_INFO, "[ITER] row=%ld nnz=%d delay=%dms y=%.6f", row, nnz, delay_ms, acc);
+		#endif
 
 		usleep(delay_us);
 
@@ -197,6 +206,11 @@ int main(int argc, char* argv[]) {
 	}
 
 	mal_finalize();
+	const double compute_seconds = MPI_Wtime() - t0;
+
+	#if !BENCH_CSV
+	(void)compute_seconds;
+	#endif
 
 	if (mal_rank() == 0) {
 
@@ -221,17 +235,27 @@ int main(int argc, char* argv[]) {
 
 				errors++;
 
+				#if !BENCH_CSV
 				if (errors <= 3) {
 
 					MAL_LOG(MAL_LOG_ERROR, "[CHECK] row=%ld y=%.12f expected=%.12f err=%.3e", r, y[r], expected, err);
 
 				}
+				#endif
 
 			}
 
 		}
 
-		MAL_LOG(MAL_LOG_INFO, "[RESULT] sparse mat-vec %s (rows=%d cols=%d nnz=%ld errors=%d max_abs_err=%.3e)", errors == 0 ? "OK" : "WRONG", SPARSE_ROWS, SPARSE_COLS, total_nnz, errors, max_abs_err);
+		#if BENCH_CSV
+
+			print_bench_csv("sparse", "malleable", "std", mal_size(), SPARSE_ROWS, compute_seconds, errors);
+
+		#else
+
+			MAL_LOG(MAL_LOG_INFO, "[RESULT] sparse mat-vec %s (rows=%d cols=%d nnz=%ld errors=%d max_abs_err=%.3e)", errors == 0 ? "OK" : "WRONG", SPARSE_ROWS, SPARSE_COLS, total_nnz, errors, max_abs_err);
+
+		#endif
 
 	}
 

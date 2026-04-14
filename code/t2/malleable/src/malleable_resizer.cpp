@@ -678,7 +678,7 @@ void Resizer::collect_ranges() {
 
 				if (rel_drop > drop_trigger) {
 
-					MAL_LOG_L(MAL_LOG_DEBUG, "LB", "Phase change detected: IPC %.2f to  %.2f (drop=%.1f%%) — decaying weights", g.lb.global_ipc_ewma, new_ipc, rel_drop * 100.0);
+					MAL_LOG_L(MAL_LOG_DEBUG, "LB", "Phase change detected: IPC %.2f to %.2f (drop=%.1f%%) — decaying weights", g.lb.global_ipc_ewma, new_ipc, rel_drop * 100.0);
 
 					const double decay = 1.0 - std::min(0.9, rel_drop);
 
@@ -717,8 +717,15 @@ ResizeCandidateEval evaluate_resize_candidate(const AutoResizeMetrics& m, int cu
 
 	ResizeCandidateEval eval;
 	eval.target_n = target_n;
+	const bool lb_enabled = g.cfg.load_balancing_enabled.load(std::memory_order_relaxed);
 
 	if (current_n <= 0 || target_n <= 0) {
+
+		return eval;
+
+	}
+
+	if (!lb_enabled && target_n == current_n) {
 
 		return eval;
 
@@ -1936,17 +1943,47 @@ void Resizer::commit_phase() {
 
 		if (g.comm.active != MPI_COMM_NULL) {
 
-			MPI_Comm_free(&g.comm.active);
+			int rc = MPI_Comm_free(&g.comm.active);
+
+			if (rc != MPI_SUCCESS) {
+
+				char err[MPI_MAX_ERROR_STRING] = {};
+				int len = 0;
+				MPI_Error_string(rc, err, &len);
+				MAL_LOG_L(MAL_LOG_ERROR, "MPI", "MPI_Comm_free(active, commit) failed rc=%d msg=%.*s", rc, len, err);
+
+			}
+
 			g.comm.active = MPI_COMM_NULL;
 
 		}
 
 		int color = (g.comm.u_rank < target_) ? 0 : MPI_UNDEFINED;
-		MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
+		int rc = MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
+
+		if (rc != MPI_SUCCESS) {
+
+			char err[MPI_MAX_ERROR_STRING] = {};
+			int len = 0;
+			MPI_Error_string(rc, err, &len);
+			MAL_LOG_L(MAL_LOG_ERROR, "MPI", "MPI_Comm_split(active, commit) failed rc=%d msg=%.*s", rc, len, err);
+
+		}
 
 	}
 
 	if (g.comm.active != MPI_COMM_NULL) {
+
+		int rc = MPI_Comm_set_errhandler(g.comm.active, MPI_ERRORS_RETURN);
+
+		if (rc != MPI_SUCCESS) {
+
+			char err[MPI_MAX_ERROR_STRING] = {};
+			int len = 0;
+			MPI_Error_string(rc, err, &len);
+			MAL_LOG_L(MAL_LOG_ERROR, "MPI", "MPI_Comm_set_errhandler(active, commit) failed rc=%d msg=%.*s", rc, len, err);
+
+		}
 
 		MPI_Comm_rank(g.comm.active, &g.comm.a_rank);
 		MPI_Comm_size(g.comm.active, &g.comm.a_size);
@@ -2056,14 +2093,16 @@ ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 	}
 
-	if (m.global_throughput < kEpsThroughput || m.global_remaining < kEpsDone || m.active_n <= 0) {
+	if (m.global_remaining < kEpsDone || m.active_n <= 0) {
 
-		if (m.global_remaining < kEpsDone && m.global_throughput > kEpsThroughput) {
+		g.sync.stop.store(true, std::memory_order_release);
+		g.sync.notify();
 
-			g.sync.stop = true;
-			g.sync.notify();
+		return out;
 
-		}
+	}
+
+	if (m.global_throughput < kEpsThroughput) {
 
 		return out;
 
@@ -2399,7 +2438,7 @@ ResizeConsensus unanimous_resize_decision() {
 	const long long local_active = (long long)local_ctx.active_size;
 	const long long local_epoch = (long long)local_ctx.compute_epoch;
 
-	long long reduce_in[6]  = { local_should,  local_target, -local_should, -local_target, local_active,  local_epoch};
+	long long reduce_in[6] = { local_should, local_target, -local_should, -local_target, local_active, local_epoch};
 	long long reduce_out[6] = {0, 0, 0, 0, 0, 0};
 
 	MPI_Allreduce(reduce_in, reduce_out, 6, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
@@ -2453,6 +2492,12 @@ void advance_default_sequence_after_commit() {
 bool prepare_resize_if_needed() {
 
 	if (!g.cfg.enabled.load(std::memory_order_relaxed)) {
+
+		return false;
+
+	}
+
+	if (g.prepared_resize_ready.load(std::memory_order_acquire)) {
 
 		return false;
 
@@ -2536,6 +2581,7 @@ bool prepare_resize_if_needed() {
 		g.prepared_resize.post_eval_baseline_remaining = consensus.local_decision.post_eval_baseline_remaining;
 
 		g.prepared_resize.work = std::move(prepared);
+		g.prepared_resize_ready.store(true, std::memory_order_release);
 
 	}
 
@@ -2549,10 +2595,17 @@ void clear_prepared_resize() {
 
 	std::lock_guard lk(g.resize_mu);
 	g.prepared_resize.reset();
+	g.prepared_resize_ready.store(false, std::memory_order_release);
 
 }
 
 bool commit_prepared_resize_if_ready() {
+
+	if (!g.prepared_resize_ready.load(std::memory_order_acquire)) {
+
+		return false;
+
+	}
 
 	int prep_target = -1;
 	unsigned long long prep_local_epoch = 0;
@@ -2572,6 +2625,8 @@ bool commit_prepared_resize_if_ready() {
 		std::lock_guard lk(g.resize_mu);
 
 		if (!g.prepared_resize.ready()) {
+
+			g.prepared_resize_ready.store(false, std::memory_order_release);
 
 			return false;
 
@@ -2593,6 +2648,7 @@ bool commit_prepared_resize_if_ready() {
 		g.prepared_resize.decision_epoch = 0;
 		g.prepared_resize.local_decision_epoch = 0;
 		g.prepared_resize.post_eval_valid = false;
+		g.prepared_resize_ready.store(false, std::memory_order_release);
 
 	}
 
@@ -2760,7 +2816,7 @@ bool commit_prepared_resize_if_ready() {
 inline int effective_epoch_interval_ms() {
 
 	const int wait_ms = g.cfg.epoch_ms.load(std::memory_order_relaxed);
-	return wait_ms > 0 ? wait_ms : MAL_EPOCH_INTERVAL_MS;
+	return wait_ms > 0 ? wait_ms : kDefaultEpochIntervalMs;
 
 }
 
@@ -2823,7 +2879,6 @@ void progress_thread() {
 		}
 
 		const int epoch_snapshot_ms = effective_epoch_interval_ms();
-		const unsigned long long compute_epoch_snapshot = g.sync.compute_epoch.load(std::memory_order_acquire);
 
 		{
 
@@ -2834,7 +2889,6 @@ void progress_thread() {
 				const bool should_wake =
 					g.sync.stop.load(std::memory_order_acquire) ||
 					g.sync.attach_pending.load(std::memory_order_acquire) ||
-					(g.sync.compute_ready.load(std::memory_order_acquire) && g.sync.compute_epoch.load(std::memory_order_acquire) != compute_epoch_snapshot) ||
 					effective_epoch_interval_ms() != epoch_snapshot_ms;
 
 				if (should_wake) {
@@ -2866,9 +2920,6 @@ void progress_thread() {
 		}
 
 		const int epoch_ms = effective_epoch_interval_ms();
-		const bool compute_epoch_advanced =
-			g.sync.compute_ready.load(std::memory_order_acquire) &&
-			g.sync.compute_epoch.load(std::memory_order_acquire) != compute_epoch_snapshot;
 
 		if (epoch_ms != epoch_snapshot_ms) {
 
@@ -2881,18 +2932,19 @@ void progress_thread() {
 
 		if (now < next_resize_check) {
 
-			if (!compute_epoch_advanced) {
-
-				continue;
-
-			}
+			continue;
 
 		}
 
 		next_resize_check = now + std::chrono::milliseconds(epoch_ms);
 
 		prepare_resize_if_needed();
-		commit_prepared_resize_if_ready();
+
+		if (g.prepared_resize_ready.load(std::memory_order_acquire)) {
+
+			commit_prepared_resize_if_ready();
+
+		}
 
 		g.sync.notify();
 

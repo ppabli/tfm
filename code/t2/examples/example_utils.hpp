@@ -1,7 +1,14 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstdio>
 #include <unistd.h>
+
+#ifndef BENCH_CSV
+
+	#define BENCH_CSV 0
+
+#endif
 
 [[maybe_unused]] inline long parse_arg_long(int argc, char** argv, const char* key, long default_val) {
 
@@ -46,12 +53,49 @@
 
 [[maybe_unused]] inline useconds_t example_delay_us(useconds_t default_us) {
 
+	#if BENCH_CSV
+
+		(void)default_us;
+		return 0;
+
+	#else
+
 	return parse_env_uint("MAL_EXAMPLE_DELAY_US", default_us);
+
+	#endif
 
 }
 
 [[maybe_unused]] inline useconds_t sparse_delay_scale_percent() {
 
+	#if BENCH_CSV
+
+		return 0;
+
+	#else
+
 	return parse_env_uint("MAL_SPARSE_DELAY_SCALE_PERCENT", 100);
+
+	#endif
+
+}
+
+[[maybe_unused]] inline void print_bench_csv(const char* example, const char* variant, const char* mode, int np, long work_items, double seconds, int errors) {
+
+	#if BENCH_CSV
+
+		std::printf("CSV,%s,%s,%s,%d,%ld,%.6f,%d\n", example, variant, mode, np, work_items, seconds, errors);
+
+	#else
+
+		(void)example;
+		(void)variant;
+		(void)mode;
+		(void)np;
+		(void)work_items;
+		(void)seconds;
+		(void)errors;
+
+	#endif
 
 }

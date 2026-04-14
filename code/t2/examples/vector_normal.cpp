@@ -47,11 +47,11 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-	const long mal_n         = parse_arg_long(argc, argv, "n", 20);
+	const long mal_n = parse_arg_long(argc, argv, "n", 20);
 	const long collapse_rows = parse_arg_long(argc, argv, "rows", 4);
 	const long collapse_cols = parse_arg_long(argc, argv, "cols", 5);
-	const bool use_collapse  = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
-	const long total_n       = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
+	const bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
+	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
 
 	double* A = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
 	double* B = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
@@ -123,17 +123,25 @@ int main(int argc, char* argv[]) {
 
 		}
 
-		if (errors == 0) {
+		#if BENCH_CSV
 
-			std::printf("[RESULT] vector OK\n");
+			print_bench_csv("vector", "normal", use_collapse ? "collapse" : "flat", world_size, total_n, t1 - t0, errors);
 
-		} else {
+		#else
 
-			std::printf("[RESULT] vector WRONG\n");
+			if (errors == 0) {
 
-		}
+				std::printf("[RESULT] vector OK\n");
 
-		std::printf("[TIME] vector normal mpi mode=%s np=%d seconds=%.6f\n", use_collapse ? "collapse" : "flat", world_size, t1 - t0);
+			} else {
+
+				std::printf("[RESULT] vector WRONG\n");
+
+			}
+
+			std::printf("[TIME] vector normal mpi mode=%s np=%d seconds=%.6f\n", use_collapse ? "collapse" : "flat", world_size, t1 - t0);
+
+		#endif
 		std::free(C);
 
 	}

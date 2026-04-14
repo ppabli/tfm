@@ -8,12 +8,13 @@ int main(int argc, char* argv[]) {
 
 	mal_init();
 
-	const long mal_n         = parse_arg_long(argc, argv, "n", 20);
+	const long mal_n = parse_arg_long(argc, argv, "n", 20);
 	const long collapse_rows = parse_arg_long(argc, argv, "rows", 4);
 	const long collapse_cols = parse_arg_long(argc, argv, "cols", 5);
 
 	bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
 	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
+	double compute_seconds = 0.0;
 
 	double *A = nullptr, *B = nullptr, *C = nullptr;
 
@@ -46,9 +47,10 @@ int main(int argc, char* argv[]) {
 
 		mal_attach_vec(nd, (void**)&A, sizeof(double), total_n, -1);
 		mal_attach_vec(nd, (void**)&B, sizeof(double), total_n, -1);
-		mal_attach_vec(nd, (void**)&C, sizeof(double), total_n,  0);
+		mal_attach_vec(nd, (void**)&C, sizeof(double), total_n, 0);
 
 		const useconds_t delay_us = example_delay_us(200000);
+		const double t0 = MPI_Wtime();
 		for (; i < limit_rows; i++) {
 
 			for (; j < limit_cols; j++) {
@@ -56,7 +58,9 @@ int main(int argc, char* argv[]) {
 				long idx = i * limit_cols + j;
 				C[idx] = A[idx] + B[idx];
 
+				#if !BENCH_CSV
 				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", idx, A[idx], B[idx], C[idx]);
+				#endif
 				usleep(delay_us);
 
 				mal_check_for(nd);
@@ -64,6 +68,9 @@ int main(int argc, char* argv[]) {
 			}
 
 		}
+
+		mal_finalize();
+		compute_seconds = MPI_Wtime() - t0;
 
 	} else {
 
@@ -73,23 +80,31 @@ int main(int argc, char* argv[]) {
 
 		mal_attach_vec(f, (void**)&A, sizeof(double), mal_n, -1);
 		mal_attach_vec(f, (void**)&B, sizeof(double), mal_n, -1);
-		mal_attach_vec(f, (void**)&C, sizeof(double), mal_n,  0);
+		mal_attach_vec(f, (void**)&C, sizeof(double), mal_n, 0);
 		const useconds_t delay_us = example_delay_us(200000);
+		const double t0 = MPI_Wtime();
 
 		for (; i < limit; i++) {
 
 			C[i] = A[i] + B[i];
 
+			#if !BENCH_CSV
 			MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
+			#endif
 			usleep(delay_us);
 
 			mal_check_for(f);
 
 		}
 
+		mal_finalize();
+		compute_seconds = MPI_Wtime() - t0;
+
 	}
 
-	mal_finalize();
+	#if !BENCH_CSV
+	(void)compute_seconds;
+	#endif
 
 	if (mal_rank() == 0) {
 
@@ -106,15 +121,23 @@ int main(int argc, char* argv[]) {
 
 		}
 
-		if (errors == 0) {
+		#if BENCH_CSV
 
-			MAL_LOG(MAL_LOG_INFO, "[RESULT] vector OK");
+			print_bench_csv("vector", "malleable", use_collapse ? "collapse" : "flat", mal_size(), total_n, compute_seconds, errors);
 
-		} else {
+		#else
 
-			MAL_LOG(MAL_LOG_ERROR, "[RESULT] vector WRONG");
+			if (errors == 0) {
 
-		}
+				MAL_LOG(MAL_LOG_INFO, "[RESULT] vector OK");
+
+			} else {
+
+				MAL_LOG(MAL_LOG_ERROR, "[RESULT] vector WRONG");
+
+			}
+
+		#endif
 
 		std::free(C);
 

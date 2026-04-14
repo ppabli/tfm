@@ -1,5 +1,112 @@
 #include "malleable_resizer.cpp"
 
+static void log_mpi_error(const char* where, int rc) {
+
+	if (rc == MPI_SUCCESS) {
+
+		return;
+
+	}
+
+	char err[MPI_MAX_ERROR_STRING] = {};
+	int len = 0;
+	MPI_Error_string(rc, err, &len);
+	MAL_LOG_L(MAL_LOG_ERROR, "MPI", "%s failed rc=%d msg=%.*s", where, rc, len, err);
+
+}
+
+static bool parse_env_bool(const char* text, bool& out) {
+
+	if (!text || !*text) {
+
+		return false;
+
+	}
+
+	char* end = nullptr;
+	long n = std::strtol(text, &end, 10);
+
+	if (end != text && *end == '\0') {
+
+		out = (n != 0);
+		return true;
+
+	}
+
+	if (std::strcmp(text, "true") == 0 || std::strcmp(text, "TRUE") == 0 || std::strcmp(text, "on") == 0 || std::strcmp(text, "ON") == 0 || std::strcmp(text, "yes") == 0 || std::strcmp(text, "YES") == 0) {
+
+		out = true;
+		return true;
+
+	}
+
+	if (std::strcmp(text, "false") == 0 || std::strcmp(text, "FALSE") == 0 || std::strcmp(text, "off") == 0 || std::strcmp(text, "OFF") == 0 || std::strcmp(text, "no") == 0 || std::strcmp(text, "NO") == 0) {
+
+		out = false;
+		return true;
+
+	}
+
+	return false;
+
+}
+
+static bool parse_env_log_level(const char* text, MalLogLevel& out) {
+
+	if (!text || !*text) {
+
+		return false;
+
+	}
+
+	char* end = nullptr;
+	long n = std::strtol(text, &end, 10);
+
+	if (end != text && *end == '\0') {
+
+		if (n < MAL_LOG_DEBUG || n > MAL_LOG_ERROR) {
+
+			return false;
+
+		}
+
+		out = (MalLogLevel)n;
+		return true;
+
+	}
+
+	if (std::strcmp(text, "DEBUG") == 0 || std::strcmp(text, "debug") == 0) {
+
+		out = MAL_LOG_DEBUG;
+		return true;
+
+	}
+
+	if (std::strcmp(text, "INFO") == 0 || std::strcmp(text, "info") == 0) {
+
+		out = MAL_LOG_INFO;
+		return true;
+
+	}
+
+	if (std::strcmp(text, "WARN") == 0 || std::strcmp(text, "warn") == 0 || std::strcmp(text, "WARNING") == 0 || std::strcmp(text, "warning") == 0) {
+
+		out = MAL_LOG_WARN;
+		return true;
+
+	}
+
+	if (std::strcmp(text, "ERROR") == 0 || std::strcmp(text, "error") == 0) {
+
+		out = MAL_LOG_ERROR;
+		return true;
+
+	}
+
+	return false;
+
+}
+
 void mal_set_epoch_interval_ms(int ms) {
 
 	if (ms > 0) {
@@ -134,32 +241,12 @@ bool parse_resize_sequence(const char* text, std::vector<int>& seq_out, bool& fo
 
 void load_resize_sequence_or_abort() {
 
-	const char* source_name = nullptr;
-	const char* source_value = nullptr;
+	const char* source_name = "MAL_RESIZE_SEQ";
+	const char* source_value = std::getenv("MAL_RESIZE_SEQ");
 
-	if (const char* v = std::getenv("MAL_RESIZE_SEQ")) {
+	if (!source_value || !*source_value) {
 
-		if (*v) {
-
-			source_name = "MAL_RESIZE_SEQ";
-			source_value = v;
-
-		}
-
-	}
-
-	if (!source_value) {
-
-		#ifdef MAL_DEFAULT_RESIZE_SEQ
-			source_name = "MAL_DEFAULT_RESIZE_SEQ";
-			source_value = MAL_DEFAULT_RESIZE_SEQ;
-		#endif
-
-	}
-
-	if (!source_name || !source_value) {
-
-		MAL_LOG_L(MAL_LOG_ERROR, "CONFIG", "Missing resize sequence: set MAL_RESIZE_SEQ or define MAL_DEFAULT_RESIZE_SEQ at build time");
+		MAL_LOG_L(MAL_LOG_ERROR, "CONFIG", "Missing resize sequence: set MAL_RESIZE_SEQ");
 		std::abort();
 
 	}
@@ -176,6 +263,7 @@ void load_resize_sequence_or_abort() {
 
 	if (!apply_resize_sequence(seq, source_name)) {
 
+		MAL_LOG_L(MAL_LOG_ERROR, "CONFIG", "Failed to apply resize sequence from %s", source_name);
 		std::abort();
 
 	}
@@ -202,6 +290,40 @@ void validate_resize_sequence_against_universe_or_abort() {
 }
 
 void load_env_config() {
+
+	if (const char* v = std::getenv("MAL_LOG_LEVEL")) {
+
+		MalLogLevel level;
+
+		if (parse_env_log_level(v, level)) {
+
+			g.cfg.log_level.store(level, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_LOG_LEVEL=%s", mal_log_level_name(level));
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_LOG_LEVEL='%s' (valid: DEBUG/INFO/WARN/ERROR or 0..3)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_LOG_ALL_RANKS")) {
+
+		bool all_ranks = false;
+
+		if (parse_env_bool(v, all_ranks)) {
+
+			g.cfg.log_all_ranks.store(all_ranks, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_LOG_ALL_RANKS=%d", (int)all_ranks);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_LOG_ALL_RANKS='%s' (valid bool)", v);
+
+		}
+
+	}
 
 	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
@@ -246,9 +368,59 @@ void load_env_config() {
 
 	if (const char* v = std::getenv("MAL_RESIZE_ENABLED")) {
 
-		bool val = std::strtol(v, nullptr, 10) != 0;
-		g.cfg.enabled.store(val);
-		MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_RESIZE_ENABLED=%d", (int)val);
+		bool val = false;
+
+		if (parse_env_bool(v, val)) {
+
+			g.cfg.enabled.store(val, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_RESIZE_ENABLED=%d", (int)val);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_RESIZE_ENABLED='%s' (valid bool)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_MALLEABILITY_ENABLED")) {
+
+		bool val = false;
+
+		if (parse_env_bool(v, val)) {
+
+			g.cfg.malleability_enabled.store(val, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_MALLEABILITY_ENABLED=%d", (int)val);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_MALLEABILITY_ENABLED='%s' (valid bool)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_LOAD_BALANCING_ENABLED")) {
+
+		bool val = false;
+
+		if (parse_env_bool(v, val)) {
+
+			g.cfg.load_balancing_enabled.store(val, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_LOAD_BALANCING_ENABLED=%d", (int)val);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_LOAD_BALANCING_ENABLED='%s' (valid bool)", v);
+
+		}
+
+	}
+
+	if (!g.cfg.malleability_enabled.load(std::memory_order_relaxed)) {
+
+		g.cfg.enabled.store(false, std::memory_order_relaxed);
+		MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "Malleability disabled: forcing MAL_RESIZE_ENABLED=0");
 
 	}
 
@@ -259,7 +431,7 @@ void load_env_config() {
 
 		if (end == v) {
 
-			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AFFINITY='%s' (invalid), using compile-time default (%d)", v, MAL_AFFINITY_ENABLED);
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_AFFINITY='%s' (invalid), using default (%d)", v, (int)kDefaultAffinityEnabled);
 
 		} else {
 
@@ -277,7 +449,7 @@ void load_env_config() {
 
 		if (end == v || val < 0) {
 
-			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_MAIN_CORE='%s' (must be >= 0), using compile-time default (%d)", v, MAL_MAIN_CORE_DEFAULT);
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_MAIN_CORE='%s' (must be >= 0), using default (%d)", v, kDefaultMainCore);
 
 		} else {
 
@@ -295,7 +467,7 @@ void load_env_config() {
 
 		if (end == v || val < 0) {
 
-			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_WORKER_CORE='%s' (must be >= 0), using compile-time default (%d)", v, MAL_WORKER_CORE_DEFAULT);
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_WORKER_CORE='%s' (must be >= 0), using default (%d)", v, kDefaultWorkerCore);
 
 		} else {
 
@@ -313,7 +485,7 @@ void load_env_config() {
 
 		if (end == v || val <= 0) {
 
-			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_INITIAL_SIZE='%s' (must be > 0), using compile-time default (%d)", v, MAL_INITIAL_SIZE);
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_INITIAL_SIZE='%s' (must be > 0), using default (%d)", v, kDefaultInitialSize);
 
 		} else {
 
@@ -353,11 +525,40 @@ void mal_init(MalResizePolicy policy) {
 
 	papi_init();
 
-	MPI_Session_init(MPI_INFO_NULL, MPI_ERRORS_RETURN, &g.comm.session);
-	MPI_Group_from_session_pset(g.comm.session, "mpi://WORLD", &g.comm.world_group);
-	MPI_Comm_create_from_group(g.comm.world_group, "malleable.universe", MPI_INFO_NULL, MPI_ERRORS_RETURN, &g.comm.universe);
-	MPI_Comm_rank(g.comm.universe, &g.comm.u_rank);
-	MPI_Comm_size(g.comm.universe, &g.comm.u_size);
+	int rc = MPI_Session_init(MPI_INFO_NULL, MPI_ERRORS_RETURN, &g.comm.session);
+
+	if (rc != MPI_SUCCESS) {
+
+		log_mpi_error("MPI_Session_init", rc);
+		std::abort();
+
+	}
+
+	rc = MPI_Group_from_session_pset(g.comm.session, "mpi://WORLD", &g.comm.world_group);
+
+	if (rc != MPI_SUCCESS) {
+
+		log_mpi_error("MPI_Group_from_session_pset", rc);
+		std::abort();
+
+	}
+
+	rc = MPI_Comm_create_from_group(g.comm.world_group, "malleable.universe", MPI_INFO_NULL, MPI_ERRORS_RETURN, &g.comm.universe);
+
+	if (rc != MPI_SUCCESS || g.comm.universe == MPI_COMM_NULL) {
+
+		log_mpi_error("MPI_Comm_create_from_group(universe)", rc);
+		std::abort();
+
+	}
+
+	rc = MPI_Comm_set_errhandler(g.comm.universe, MPI_ERRORS_RETURN);
+	log_mpi_error("MPI_Comm_set_errhandler(universe)", rc);
+
+	rc = MPI_Comm_rank(g.comm.universe, &g.comm.u_rank);
+	log_mpi_error("MPI_Comm_rank(universe)", rc);
+	rc = MPI_Comm_size(g.comm.universe, &g.comm.u_size);
+	log_mpi_error("MPI_Comm_size(universe)", rc);
 
 	if (policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
@@ -371,12 +572,19 @@ void mal_init(MalResizePolicy policy) {
 
 	#endif
 
-	const int effective_initial_size = g.cfg.initial_size > 0 ? std::min(g.cfg.initial_size, g.comm.u_size) : g.comm.u_size;
+	int effective_initial_size = g.cfg.initial_size > 0 ? std::min(g.cfg.initial_size, g.comm.u_size) : g.comm.u_size;
+
+	if (!g.cfg.malleability_enabled.load(std::memory_order_relaxed)) {
+
+		effective_initial_size = g.comm.u_size;
+
+	}
 
 	MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "Initial active size: %d (universe=%d)", effective_initial_size, g.comm.u_size);
 
 	int color = (g.comm.u_rank < effective_initial_size) ? 0 : MPI_UNDEFINED;
-	MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
+	rc = MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
+	log_mpi_error("MPI_Comm_split(active, init)", rc);
 
 	g.worker = std::thread(progress_thread);
 
@@ -388,8 +596,13 @@ void mal_init(MalResizePolicy policy) {
 
 	if (g.comm.active != MPI_COMM_NULL) {
 
-		MPI_Comm_rank(g.comm.active, &g.comm.a_rank);
-		MPI_Comm_size(g.comm.active, &g.comm.a_size);
+		rc = MPI_Comm_set_errhandler(g.comm.active, MPI_ERRORS_RETURN);
+		log_mpi_error("MPI_Comm_set_errhandler(active, init)", rc);
+
+		rc = MPI_Comm_rank(g.comm.active, &g.comm.a_rank);
+		log_mpi_error("MPI_Comm_rank(active)", rc);
+		rc = MPI_Comm_size(g.comm.active, &g.comm.a_size);
+		log_mpi_error("MPI_Comm_size(active)", rc);
 
 	} else {
 
@@ -495,9 +708,48 @@ void vec_gather(MalVec& v) {
 
 	MPI_Gatherv(my_seg_flat.empty() ? nullptr : my_seg_flat.data(), my_seg_count, MPI_LONG, all_segs.empty() ? nullptr : all_segs.data(), root ? seg_counts.data() : nullptr, root ? seg_displs.data() : nullptr, MPI_LONG, v.gather_root, g.comm.universe);
 
-	long my_data_bytes = v.local_n * (long)v.elem_size;
+	long my_done_elems = 0;
+
+	for (size_t si = 1; si < my_seg_flat.size(); si += 2) {
+
+		my_done_elems += my_seg_flat[si];
+
+	}
+
+	if (MAL_UNLIKELY(my_done_elems < 0)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "GATHER", "Negative done element count in vec_gather (%ld)", my_done_elems);
+		MPI_Abort(g.comm.universe, 1);
+
+	}
+
+	if (MAL_UNLIKELY(my_done_elems > v.local_n)) {
+
+		MAL_LOG_L(MAL_LOG_WARN, "GATHER", "done segments exceed local buffer (%ld > %ld), clamping", my_done_elems, v.local_n);
+		my_done_elems = v.local_n;
+
+	}
+
+	long my_data_bytes = my_done_elems * (long)v.elem_size;
+
+	if (MAL_UNLIKELY(my_data_bytes > INT_MAX)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "GATHER", "Local send size overflow in vec_gather (%ld bytes)", my_data_bytes);
+		MPI_Abort(g.comm.universe, 1);
+
+	}
 
 	std::vector<int> data_counts, data_displs;
+	int my_send_bytes = (int)my_data_bytes;
+	std::vector<int> all_send_bytes;
+
+	if (root) {
+
+		all_send_bytes.resize(usiz);
+
+	}
+
+	MPI_Gather(&my_send_bytes, 1, MPI_INT, root ? all_send_bytes.data() : nullptr, 1, MPI_INT, v.gather_root, g.comm.universe);
 
 	void* recv_raw = nullptr;
 	size_t recv_cap = 0;
@@ -508,15 +760,14 @@ void vec_gather(MalVec& v) {
 
 		for (int k = 0; k < usiz; k++) {
 
-			long total = 0;
+			if (MAL_UNLIKELY(all_send_bytes[k] < 0)) {
 
-			for (int s = 0; s < seg_counts[k] / 2; s++) {
-
-				total += all_segs[seg_displs[k] + s * 2 + 1];
+				MAL_LOG_L(MAL_LOG_ERROR, "GATHER", "Negative send size from rank=%d in vec_gather (%d)", k, all_send_bytes[k]);
+				MPI_Abort(g.comm.universe, 1);
 
 			}
 
-			data_counts[k] = (int)(total * (long)v.elem_size);
+			data_counts[k] = all_send_bytes[k];
 
 		}
 
@@ -532,18 +783,44 @@ void vec_gather(MalVec& v) {
 	if (root && v.result_buf) {
 
 		char* recv_buf = static_cast<char*>(recv_raw);
-		long data_off = 0;
 
 		for (int k = 0; k < usiz; k++) {
+
+			long rank_used = 0;
+			const long rank_bytes = data_counts[k];
 
 			for (int s = 0; s < seg_counts[k] / 2; s++) {
 
 				long gs = all_segs[seg_displs[k] + s * 2];
 				long cnt = all_segs[seg_displs[k] + s * 2 + 1];
+				const long seg_bytes = cnt * (long)v.elem_size;
 
-				std::memcpy(static_cast<char*>(v.result_buf) + gs * (long)v.elem_size, recv_buf + data_off, cnt * (long)v.elem_size);
+				if (seg_bytes <= 0) {
 
-				data_off += cnt * (long)v.elem_size;
+					continue;
+
+				}
+
+				if (rank_used >= rank_bytes) {
+
+					MAL_LOG_L(MAL_LOG_WARN, "GATHER", "Insufficient gathered bytes for rank=%d (segments exceed payload)", k);
+					break;
+
+				}
+
+				const long available = rank_bytes - rank_used;
+				const long copy_bytes = std::min(seg_bytes, available);
+
+				std::memcpy(static_cast<char*>(v.result_buf) + gs * (long)v.elem_size, recv_buf + data_displs[k] + rank_used, copy_bytes);
+
+				if (copy_bytes < seg_bytes) {
+
+					MAL_LOG_L(MAL_LOG_WARN, "GATHER", "Truncated segment copy for rank=%d seg=%d (%ld/%ld bytes)", k, s, copy_bytes, seg_bytes);
+					break;
+
+				}
+
+				rank_used += copy_bytes;
 
 			}
 
@@ -563,12 +840,20 @@ void mal_finalize() {
 
 	mal_wait_attach_tasks();
 
-	g.sync.stop = true;
+	// Do not force a local stop here: if one rank exits its worker early while others
+	// are still inside resize-decision collectives, the job can deadlock/hard-abort.
+	// Let the worker stop via the global runtime condition.
+	if (!g.cfg.malleability_enabled.load(std::memory_order_relaxed)) {
+
+		g.sync.stop.store(true, std::memory_order_release);
+
+	}
 
 	g.sync.notify();
 	g.worker.join();
 
-	MPI_Barrier(g.comm.universe);
+	int rc = MPI_Barrier(g.comm.universe);
+	log_mpi_error("MPI_Barrier(universe, pre-finalize)", rc);
 
 	for (auto& vp : g.vecs) {
 
@@ -607,7 +892,8 @@ void mal_finalize() {
 
 	int naccs = (int)g.accs.size();
 
-	MPI_Bcast(&naccs, 1, MPI_INT, 0, g.comm.universe);
+	rc = MPI_Bcast(&naccs, 1, MPI_INT, 0, g.comm.universe);
+	log_mpi_error("MPI_Bcast(naccs, finalize)", rc);
 
 	struct FinalAccGetter {
 
@@ -673,13 +959,29 @@ void mal_finalize() {
 
 	if (g.comm.active != MPI_COMM_NULL) {
 
-		MPI_Comm_free(&g.comm.active);
+		rc = MPI_Barrier(g.comm.active);
+		log_mpi_error("MPI_Barrier(active, pre-free)", rc);
+
+		rc = MPI_Comm_free(&g.comm.active);
+		log_mpi_error("MPI_Comm_free(active)", rc);
+		g.comm.active = MPI_COMM_NULL;
 
 	}
 
-	MPI_Comm_free(&g.comm.universe);
-	MPI_Group_free(&g.comm.world_group);
-	MPI_Session_finalize(&g.comm.session);
+	rc = MPI_Barrier(g.comm.universe);
+	log_mpi_error("MPI_Barrier(universe, pre-teardown)", rc);
+
+	rc = MPI_Comm_free(&g.comm.universe);
+	log_mpi_error("MPI_Comm_free(universe)", rc);
+	g.comm.universe = MPI_COMM_NULL;
+
+	rc = MPI_Group_free(&g.comm.world_group);
+	log_mpi_error("MPI_Group_free(world_group)", rc);
+	g.comm.world_group = MPI_GROUP_NULL;
+
+	rc = MPI_Session_finalize(&g.comm.session);
+	log_mpi_error("MPI_Session_finalize(session)", rc);
+	g.comm.session = MPI_SESSION_NULL;
 
 	papi_finalize();
 
@@ -714,7 +1016,7 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 	f.user_iter = &iter;
 	f.user_limit = &limit;
 
-	if (g.pending && !g.pending->ranges.empty()) {
+	if (g.sync.pending_has_ranges.load(std::memory_order_acquire)) {
 
 		load_pending_ranges_into_loop(f);
 		f.phase.store(MAL_LOOP_ATTACHING, std::memory_order_relaxed);
@@ -743,13 +1045,21 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 	g.sync.compute_ready = false;
 	g.loop = &f;
 
-	while (f.start == f.end && !g.sync.stop) {
+	const bool skip_idle_activation_wait = (f.start == f.end) && !g.sync.pending_has_ranges.load(std::memory_order_acquire) && (total_iters <= g.comm.a_size);
+
+	while (!skip_idle_activation_wait && f.start == f.end && !g.sync.stop.load(std::memory_order_acquire)) {
 
 		f.current = f.end;
 		f.phase.store(MAL_LOOP_WAITING_ACTIVATION, std::memory_order_relaxed);
 		g.sync.compute_wait(has_work_or_stop);
 
-		if (f.start == f.end && g.pending && !g.pending->ranges.empty()) {
+		if (g.sync.stop.load(std::memory_order_acquire)) {
+
+			break;
+
+		}
+
+		if (f.start == f.end && g.sync.pending_has_ranges.load(std::memory_order_acquire)) {
 
 			load_pending_ranges_into_loop(f);
 			f.phase.store(MAL_LOOP_ATTACHING, std::memory_order_relaxed);
@@ -835,6 +1145,14 @@ void mal_check_for(MalFor& f) {
 
 	if (g.sync.stop) {
 
+		return;
+
+	}
+
+	if (!g.cfg.malleability_enabled.load(std::memory_order_relaxed)) {
+
+		g.sync.stop.store(true, std::memory_order_release);
+		g.sync.notify();
 		return;
 
 	}

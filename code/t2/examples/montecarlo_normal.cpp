@@ -62,9 +62,18 @@ int main(int argc, char* argv[]) {
 
 	if (world_rank == 0) {
 
-		const double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(total_points);
-		std::printf("[RESULT] montecarlo OK total_points=%ld  hits=%ld  pi~=%.6f  error=%.2e\n", total_points, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
-		std::printf("[TIME] montecarlo normal mpi np=%d seconds=%.6f\n", world_size, t1 - t0);
+		#if BENCH_CSV
+
+			print_bench_csv("montecarlo", "normal", "std", world_size, total_points, t1 - t0, 0);
+
+		#else
+
+			const double pi_approx = 4.0 * static_cast<double>(hits) / static_cast<double>(total_points);
+
+			std::printf("[RESULT] montecarlo OK total_points=%ld hits=%ld pi~=%.6f error=%.2e\n", total_points, hits, pi_approx, std::fabs(pi_approx - 3.14159265358979));
+			std::printf("[TIME] montecarlo normal mpi np=%d seconds=%.6f\n", world_size, t1 - t0);
+
+		#endif
 
 	}
 

@@ -2,6 +2,7 @@
 #define MALLEABLE_TYPES_CPP_INCLUDED
 
 #include "malleable.hpp"
+#include "malleable_papi.cpp"
 
 #include <algorithm>
 #include <atomic>
@@ -68,6 +69,17 @@ enum EpochChangeMode {
 	MAL_EPOCH_CHANGE_RECALCULATE = 0,
 	MAL_EPOCH_CHANGE_USE_LAST_DECISION = 1,
 };
+
+constexpr int kDefaultInitialSize = INT_MAX;
+constexpr int kDefaultEpochIntervalMs = 1000;
+constexpr int kDefaultEpochChangeMode = MAL_EPOCH_CHANGE_RECALCULATE;
+constexpr MalLogLevel kDefaultLogLevel = MAL_LOG_INFO;
+constexpr bool kDefaultLogAllRanks = false;
+constexpr bool kDefaultAffinityEnabled = true;
+constexpr int kDefaultMainCore = -1;
+constexpr int kDefaultWorkerCore = -1;
+constexpr bool kDefaultMalleabilityEnabled = false;
+constexpr bool kDefaultLoadBalancingEnabled = false;
 
 class Resizer;
 
@@ -389,9 +401,13 @@ struct MalState {
 		std::vector<int> sequence;
 		std::atomic<size_t> seq_idx{0};
 		MalResizePolicy resize_policy{MAL_RESIZE_POLICY_AUTO};
-		std::atomic<int> epoch_ms{MAL_EPOCH_INTERVAL_MS};
-		std::atomic<int> epoch_change_mode{MAL_EPOCH_CHANGE_MODE};
+		std::atomic<int> epoch_ms{kDefaultEpochIntervalMs};
+		std::atomic<int> epoch_change_mode{kDefaultEpochChangeMode};
 		std::atomic<bool> enabled{true};
+		std::atomic<MalLogLevel> log_level{kDefaultLogLevel};
+		std::atomic<bool> log_all_ranks{kDefaultLogAllRanks};
+		std::atomic<bool> malleability_enabled{kDefaultMalleabilityEnabled};
+		std::atomic<bool> load_balancing_enabled{kDefaultLoadBalancingEnabled};
 		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
 
 		double auto_bandwidth_bps{1e9};
@@ -404,11 +420,11 @@ struct MalState {
 		int auto_candidate_radius{1};
 		int auto_candidate_stride{4};
 
-		bool affinity_enabled{MAL_AFFINITY_ENABLED != 0};
-		int main_core{MAL_MAIN_CORE_DEFAULT};
-		int worker_core{MAL_WORKER_CORE_DEFAULT};
+		bool affinity_enabled{kDefaultAffinityEnabled};
+		int main_core{kDefaultMainCore};
+		int worker_core{kDefaultWorkerCore};
 		int resolved_main_core{-1};
-		int initial_size{MAL_INITIAL_SIZE};
+		int initial_size{kDefaultInitialSize};
 
 	} cfg;
 
@@ -545,6 +561,7 @@ struct MalState {
 
 	std::mutex resize_mu;
 	PreparedResize prepared_resize;
+	std::atomic<bool> prepared_resize_ready{false};
 
 	std::mutex attach_mu;
 	std::vector<std::function<void()>> attach_tasks;
@@ -909,6 +926,39 @@ void pin_worker_thread_to_ecore(std::thread& t) noexcept {
 int mal_rank() {
 
 	return g.comm.u_rank;
+
+}
+
+int mal_size() {
+
+	return g.comm.u_size;
+
+}
+
+double mal_log_time_s() {
+
+	static const auto t0 = std::chrono::steady_clock::now();
+	const auto now = std::chrono::steady_clock::now();
+
+	return std::chrono::duration<double>(now - t0).count();
+
+}
+
+bool mal_should_log(MalLogLevel level) {
+
+	if ((int)level < (int)g.cfg.log_level.load(std::memory_order_relaxed)) {
+
+		return false;
+
+	}
+
+	if (g.cfg.log_all_ranks.load(std::memory_order_relaxed)) {
+
+		return true;
+
+	}
+
+	return mal_rank() <= 0;
 
 }
 
@@ -1918,8 +1968,21 @@ std::vector<long> build_partition_cuts(long total, int nprocs) {
 
 	const auto& w = g.lb.weights;
 	std::vector<long> cuts((size_t)std::max(0, nprocs) + 1, 0);
+	const bool lb_enabled = g.cfg.load_balancing_enabled.load(std::memory_order_relaxed);
 
 	if (nprocs <= 0) {
+
+		return cuts;
+
+	}
+
+	if (!lb_enabled) {
+
+		for (int r = 0; r < nprocs; r++) {
+
+			distribute(total, nprocs, r, cuts[(size_t)r], cuts[(size_t)r + 1]);
+
+		}
 
 		return cuts;
 

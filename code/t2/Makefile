@@ -3,13 +3,12 @@ AR = ar
 MPIRUN = mpirun
 
 NP = 4
-MAL_DEFAULT_RESIZE_SEQ = 2,4,4,3,1,4
-MAL_LOG_LEVEL ?= MAL_LOG_INFO
+BENCH_CSV ?= 0
 
 USE_PAPI ?= 0
 PAPI_PREFIX ?= $(HOME)/Desktop/papi/src/install
 
-CXXFLAGS = -O2 -march=native -Wall -std=c++20 -MMD -MP -Imalleable/include -DMAL_DEFAULT_RESIZE_SEQ=\"$(MAL_DEFAULT_RESIZE_SEQ)\" -DMAL_LOG_LEVEL=$(MAL_LOG_LEVEL)
+CXXFLAGS = -O2 -march=native -Wall -std=c++20 -MMD -MP -Imalleable/include -DBENCH_CSV=$(BENCH_CSV)
 LIBS = -lpthread
 
 ifeq ($(USE_PAPI), 1)

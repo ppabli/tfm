@@ -131,7 +131,12 @@ int run_matvec(int world_rank, int world_size, int M, int K, double* elapsed_out
 
 		}
 
-		std::printf("[RESULT] mat-vec %s (%d errors)\n", errors == 0 ? "OK" : "WRONG", errors);
+		#if !BENCH_CSV
+
+			std::printf("[RESULT] mat-vec %s (%d errors)\n", errors == 0 ? "OK" : "WRONG", errors);
+
+		#endif
+
 		std::free(y);
 
 	}
@@ -243,7 +248,12 @@ int run_matmul(int world_rank, int world_size, int M, int K, int N, double* elap
 
 		}
 
-		std::printf("[RESULT] mat-mat %s (%d errors)\n", errors == 0 ? "OK" : "WRONG", errors);
+		#if !BENCH_CSV
+
+			std::printf("[RESULT] mat-mat %s (%d errors)\n", errors == 0 ? "OK" : "WRONG", errors);
+
+			#endif
+
 		std::free(C);
 
 	}
@@ -270,20 +280,33 @@ int main(int argc, char* argv[]) {
 
 	const bool do_mv = (argc > 1 && std::strcmp(argv[1], "mv") == 0);
 	double elapsed = 0.0;
+	int errors = 0;
 
 	if (do_mv) {
 
-		run_matvec(world_rank, world_size, M, K, &elapsed);
+		errors = run_matvec(world_rank, world_size, M, K, &elapsed);
 
 	} else {
 
-		run_matmul(world_rank, world_size, M, K, N, &elapsed);
+		errors = run_matmul(world_rank, world_size, M, K, N, &elapsed);
 
 	}
 
+	#if !BENCH_CSV
+		(void)errors;
+	#endif
+
 	if (world_rank == 0) {
 
-		std::printf("[TIME] %s normal mpi np=%d seconds=%.6f\n", do_mv ? "mat-vec" : "mat-mat", world_size, elapsed);
+		#if BENCH_CSV
+
+			print_bench_csv("matmul", "normal", do_mv ? "mv" : "mm", world_size, do_mv ? (long)M : (long)M * (long)N, elapsed, errors);
+
+		#else
+
+			std::printf("[TIME] %s normal mpi np=%d seconds=%.6f\n", do_mv ? "mat-vec" : "mat-mat", world_size, elapsed);
+
+		#endif
 
 	}
 

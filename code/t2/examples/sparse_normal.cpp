@@ -6,8 +6,8 @@
 #include <mpi.h>
 #include "example_utils.hpp"
 
-static int SPARSE_ROWS      = 3600;
-static int SPARSE_COLS      = 4096;
+static int SPARSE_ROWS = 3600;
+static int SPARSE_COLS = 4096;
 static int SPARSE_MAX_ROW_NNZ = 240;
 
 struct BlockRange {
@@ -164,8 +164,8 @@ int main(int argc, char* argv[]) {
 
 	MPI_Init(&argc, &argv);
 
-	SPARSE_ROWS       = static_cast<int>(parse_arg_long(argc, argv, "rows",    3600));
-	SPARSE_COLS       = static_cast<int>(parse_arg_long(argc, argv, "cols",    4096));
+	SPARSE_ROWS = static_cast<int>(parse_arg_long(argc, argv, "rows", 3600));
+	SPARSE_COLS = static_cast<int>(parse_arg_long(argc, argv, "cols", 4096));
 	SPARSE_MAX_ROW_NNZ = static_cast<int>(parse_arg_long(argc, argv, "max-nnz", 240));
 
 	int world_rank = 0;
@@ -254,18 +254,29 @@ int main(int argc, char* argv[]) {
 			if (err > 1e-9) {
 
 				errors++;
+
+				#if !BENCH_CSV
 				if (errors <= 3) {
 
 					std::printf("[CHECK] row=%ld y=%.12f expected=%.12f err=%.3e\n", r, y[r], expected, err);
 
 				}
+				#endif
 
 			}
 
 		}
 
-		std::printf("[RESULT] sparse mat-vec %s (rows=%d cols=%d nnz=%ld errors=%d max_abs_err=%.3e)\n", errors == 0 ? "OK" : "WRONG", SPARSE_ROWS, SPARSE_COLS, total_nnz, errors, max_abs_err);
-		std::printf("[TIME] sparse normal mpi np=%d seconds=%.6f\n", world_size, t1 - t0);
+		#if BENCH_CSV
+
+			print_bench_csv("sparse", "normal", "std", world_size, SPARSE_ROWS, t1 - t0, errors);
+
+		#else
+
+			std::printf("[RESULT] sparse mat-vec %s (rows=%d cols=%d nnz=%ld errors=%d max_abs_err=%.3e)\n", errors == 0 ? "OK" : "WRONG", SPARSE_ROWS, SPARSE_COLS, total_nnz, errors, max_abs_err);
+			std::printf("[TIME] sparse normal mpi np=%d seconds=%.6f\n", world_size, t1 - t0);
+
+		#endif
 		std::free(y);
 
 	}
