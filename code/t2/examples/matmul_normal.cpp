@@ -72,7 +72,12 @@ int run_matvec(int world_rank, int world_size, int M, int K, double* elapsed_out
 
 	const BlockRange range = block_range(M, world_rank, world_size);
 	std::vector<double> local_y(static_cast<size_t>(range.count));
-	const useconds_t delay_us = example_delay_us(100000);
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(100000);
+
+	#endif
 
 	for (long local_i = 0; local_i < range.count; local_i++) {
 
@@ -86,7 +91,12 @@ int run_matvec(int world_rank, int world_size, int M, int K, double* elapsed_out
 		}
 
 		local_y[static_cast<size_t>(local_i)] = acc;
-		usleep(delay_us);
+
+		#if !BENCH_CSV
+
+			usleep(delay_us);
+
+		#endif
 
 	}
 
@@ -186,7 +196,12 @@ int run_matmul(int world_rank, int world_size, int M, int K, int N, double* elap
 
 	const BlockRange range = block_range(M, world_rank, world_size);
 	std::vector<double> local_c(static_cast<size_t>(range.count * N));
-	const useconds_t delay_us = example_delay_us(100000);
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(100000);
+
+	#endif
 
 	for (long local_i = 0; local_i < range.count; local_i++) {
 
@@ -206,7 +221,11 @@ int run_matmul(int world_rank, int world_size, int M, int K, int N, double* elap
 
 		}
 
-		usleep(delay_us);
+		#if !BENCH_CSV
+
+			usleep(delay_us);
+
+		#endif
 
 	}
 
@@ -293,7 +312,9 @@ int main(int argc, char* argv[]) {
 	}
 
 	#if !BENCH_CSV
+
 		(void)errors;
+
 	#endif
 
 	if (world_rank == 0) {

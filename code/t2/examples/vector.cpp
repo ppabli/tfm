@@ -42,6 +42,7 @@ int main(int argc, char* argv[]) {
 
 		long* iters[2] = {&i, &j};
 		long* loop_limits[2] = {&limit_rows, &limit_cols};
+		const double t0 = MPI_Wtime();
 
 		MalForND nd = mal_for_nd_begin(iters, loop_limits, starts, limits2d, 2);
 
@@ -49,8 +50,12 @@ int main(int argc, char* argv[]) {
 		mal_attach_vec(nd, (void**)&B, sizeof(double), total_n, -1);
 		mal_attach_vec(nd, (void**)&C, sizeof(double), total_n, 0);
 
-		const useconds_t delay_us = example_delay_us(200000);
-		const double t0 = MPI_Wtime();
+		#if !BENCH_CSV
+
+			const useconds_t delay_us = example_delay_us(200000);
+
+		#endif
+
 		for (; i < limit_rows; i++) {
 
 			for (; j < limit_cols; j++) {
@@ -59,9 +64,11 @@ int main(int argc, char* argv[]) {
 				C[idx] = A[idx] + B[idx];
 
 				#if !BENCH_CSV
-				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", idx, A[idx], B[idx], C[idx]);
+
+					MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", idx, A[idx], B[idx], C[idx]);
+					usleep(delay_us);
+
 				#endif
-				usleep(delay_us);
 
 				mal_check_for(nd);
 
@@ -75,23 +82,30 @@ int main(int argc, char* argv[]) {
 	} else {
 
 		long i, limit;
+		const double t0 = MPI_Wtime();
 
 		MalFor f = mal_for(mal_n, i, limit);
 
 		mal_attach_vec(f, (void**)&A, sizeof(double), mal_n, -1);
 		mal_attach_vec(f, (void**)&B, sizeof(double), mal_n, -1);
 		mal_attach_vec(f, (void**)&C, sizeof(double), mal_n, 0);
-		const useconds_t delay_us = example_delay_us(200000);
-		const double t0 = MPI_Wtime();
+
+		#if !BENCH_CSV
+
+			const useconds_t delay_us = example_delay_us(200000);
+
+		#endif
 
 		for (; i < limit; i++) {
 
 			C[i] = A[i] + B[i];
 
 			#if !BENCH_CSV
-			MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
+
+				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
+				usleep(delay_us);
+
 			#endif
-			usleep(delay_us);
 
 			mal_check_for(f);
 
@@ -103,7 +117,9 @@ int main(int argc, char* argv[]) {
 	}
 
 	#if !BENCH_CSV
-	(void)compute_seconds;
+
+		(void)compute_seconds;
+
 	#endif
 
 	if (mal_rank() == 0) {

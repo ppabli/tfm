@@ -34,10 +34,15 @@ void run_matvec(int M, int K) {
 
 	}
 
+	const double t0 = MPI_Wtime();
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
-	const useconds_t delay_us = example_delay_us(100000);
-	const double t0 = MPI_Wtime();
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(100000);
+
+	#endif
 
 	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
 	mal_attach_mat(f, (void**)&x, sizeof(double), 1, K, -1, MAL_ATTACH_SHARED_ACTIVE);
@@ -56,10 +61,11 @@ void run_matvec(int M, int K) {
 		y[i] = acc;
 
 		#if !BENCH_CSV
-		MAL_LOG(MAL_LOG_INFO, "[MV] y[%ld] = %.1f", i, acc);
-		#endif
 
-		usleep(delay_us);
+			MAL_LOG(MAL_LOG_INFO, "[MV] y[%ld] = %.1f", i, acc);
+			usleep(delay_us);
+
+		#endif
 
 		mal_check_for(f);
 
@@ -69,7 +75,9 @@ void run_matvec(int M, int K) {
 	const double compute_seconds = MPI_Wtime() - t0;
 
 	#if !BENCH_CSV
-	(void)compute_seconds;
+
+		(void)compute_seconds;
+
 	#endif
 
 	if (mal_rank() == 0) {
@@ -146,10 +154,15 @@ void run_matmul(int M, int K, int N) {
 
 	}
 
+	const double t0 = MPI_Wtime();
 	long i, lim;
 	MalFor f = mal_for(M, i, lim);
-	const useconds_t delay_us = example_delay_us(100000);
-	const double t0 = MPI_Wtime();
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(100000);
+
+	#endif
 
 	mal_attach_mat(f, (void**)&A, sizeof(double), M, K, -1, MAL_ATTACH_PARTITIONED);
 	mal_attach_mat(f, (void**)&B, sizeof(double), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
@@ -172,10 +185,11 @@ void run_matmul(int M, int K, int N) {
 		}
 
 		#if !BENCH_CSV
-		MAL_LOG(MAL_LOG_INFO, "[MM] C[%ld, 0..%d] computed, C[%ld,0]=%.1f", i, N-1, i, C[i * N]);
-		#endif
 
-		usleep(delay_us);
+			MAL_LOG(MAL_LOG_INFO, "[MM] C[%ld, 0..%d] computed, C[%ld,0]=%.1f", i, N-1, i, C[i * N]);
+			usleep(delay_us);
+
+		#endif
 
 		mal_check_for(f);
 
@@ -185,7 +199,9 @@ void run_matmul(int M, int K, int N) {
 	const double compute_seconds = MPI_Wtime() - t0;
 
 	#if !BENCH_CSV
-	(void)compute_seconds;
+
+		(void)compute_seconds;
+
 	#endif
 
 	if (mal_rank() == 0) {

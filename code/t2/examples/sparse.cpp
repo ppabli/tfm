@@ -159,25 +159,34 @@ int main(int argc, char* argv[]) {
 		total_nnz = build_sparse_problem(row_nnz, col_idx, values, x);
 
 		#if BENCH_CSV
-		(void)total_nnz;
+
+			(void)total_nnz;
+
 		#endif
 
 		#if !BENCH_CSV
-		MAL_LOG(MAL_LOG_INFO, "[SETUP] sparse rows=%d cols=%d max_row_nnz=%d nnz=%ld mode=auto", SPARSE_ROWS, SPARSE_COLS, SPARSE_MAX_ROW_NNZ, total_nnz);
+
+			MAL_LOG(MAL_LOG_INFO, "[SETUP] sparse rows=%d cols=%d max_row_nnz=%d nnz=%ld mode=auto", SPARSE_ROWS, SPARSE_COLS, SPARSE_MAX_ROW_NNZ, total_nnz);
+
 		#endif
 
 	}
 
+	const double t0 = MPI_Wtime();
 	long row, limit;
 	MalFor f = mal_for(SPARSE_ROWS, row, limit);
-	const useconds_t delay_scale_percent = sparse_delay_scale_percent();
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_scale_percent = sparse_delay_scale_percent();
+
+	#endif
 
 	mal_attach_mat(f, (void**)&row_nnz, sizeof(int), SPARSE_ROWS, 1, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&col_idx, sizeof(int), SPARSE_ROWS, SPARSE_MAX_ROW_NNZ, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&values, sizeof(double), SPARSE_ROWS, SPARSE_MAX_ROW_NNZ, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&x, sizeof(double), 1, SPARSE_COLS, -1, MAL_ATTACH_SHARED_ACTIVE, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
 	mal_attach_mat(f, (void**)&y, sizeof(double), SPARSE_ROWS, 1, 0, MAL_ATTACH_PARTITIONED);
-	const double t0 = MPI_Wtime();
 
 	for (; row < limit; row++) {
 
@@ -191,15 +200,18 @@ int main(int argc, char* argv[]) {
 
 		}
 
-		const int delay_ms = 4 + nnz / 2;
-		const useconds_t delay_us = (useconds_t)delay_ms * 1000u * delay_scale_percent / 100u;
 		y[row] = acc;
 
 		#if !BENCH_CSV
-		MAL_LOG(MAL_LOG_INFO, "[ITER] row=%ld nnz=%d delay=%dms y=%.6f", row, nnz, delay_ms, acc);
-		#endif
 
-		usleep(delay_us);
+			const int delay_ms = 4 + nnz / 2;
+			const useconds_t delay_us = (useconds_t)delay_ms * 1000u * delay_scale_percent / 100u;
+
+			MAL_LOG(MAL_LOG_INFO, "[ITER] row=%ld nnz=%d delay=%dms y=%.6f", row, nnz, delay_ms, acc);
+
+			usleep(delay_us);
+
+		#endif
 
 		mal_check_for(f);
 
@@ -209,7 +221,9 @@ int main(int argc, char* argv[]) {
 	const double compute_seconds = MPI_Wtime() - t0;
 
 	#if !BENCH_CSV
-	(void)compute_seconds;
+
+		(void)compute_seconds;
+
 	#endif
 
 	if (mal_rank() == 0) {
@@ -233,15 +247,8 @@ int main(int argc, char* argv[]) {
 
 			if (err > 1e-9) {
 
-				errors++;
-
-				#if !BENCH_CSV
-				if (errors <= 3) {
-
-					MAL_LOG(MAL_LOG_ERROR, "[CHECK] row=%ld y=%.12f expected=%.12f err=%.3e", r, y[r], expected, err);
-
-				}
-				#endif
+				errors = 1;
+				break;
 
 			}
 

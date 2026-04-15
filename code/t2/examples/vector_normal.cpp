@@ -76,7 +76,12 @@ int main(int argc, char* argv[]) {
 
 	const BlockRange range = block_range(total_n, world_rank, world_size);
 	std::vector<double> local_c(static_cast<size_t>(range.count));
-	const useconds_t delay_us = example_delay_us(200000);
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(200000);
+
+	#endif
 
 	for (long local_i = 0; local_i < range.count; local_i++) {
 
@@ -92,7 +97,12 @@ int main(int argc, char* argv[]) {
 		}
 
 		local_c[static_cast<size_t>(local_i)] = A[idx] + B[idx];
-		usleep(delay_us);
+
+		#if !BENCH_CSV
+
+			usleep(delay_us);
+
+		#endif
 
 	}
 

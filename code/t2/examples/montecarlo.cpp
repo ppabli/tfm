@@ -11,11 +11,16 @@ int main(int argc, char* argv[]) {
 
 	const long total_points = parse_arg_long(argc, argv, "n", 20);
 	unsigned int seed = static_cast<unsigned int>(mal_rank());
+	const double t0 = MPI_Wtime();
 
 	long i, limit;
 	MalFor f = mal_for(total_points, i, limit);
-	const useconds_t delay_us = example_delay_us(200000);
-	const double t0 = MPI_Wtime();
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(200000);
+
+	#endif
 
 	long hits = 0;
 	mal_attach_acc(f, hits);
@@ -32,10 +37,11 @@ int main(int argc, char* argv[]) {
 		}
 
 		#if !BENCH_CSV
-		MAL_LOG(MAL_LOG_INFO, "[ITER] i=%ld hits_so_far=%ld", i, hits);
-		#endif
 
-		usleep(delay_us);
+			MAL_LOG(MAL_LOG_INFO, "[ITER] i=%ld hits_so_far=%ld", i, hits);
+			usleep(delay_us);
+
+		#endif
 
 		mal_check_for(f);
 
@@ -45,7 +51,9 @@ int main(int argc, char* argv[]) {
 	const double compute_seconds = MPI_Wtime() - t0;
 
 	#if !BENCH_CSV
-	(void)compute_seconds;
+
+		(void)compute_seconds;
+
 	#endif
 
 	if (mal_rank() == 0) {

@@ -33,7 +33,12 @@ int main(int argc, char* argv[]) {
 	const long total_points = parse_arg_long(argc, argv, "n", 20);
 	unsigned int seed = static_cast<unsigned int>(world_rank);
 	const BlockRange range = block_range(total_points, world_rank, world_size);
-	const useconds_t delay_us = example_delay_us(200000);
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(200000);
+
+	#endif
 
 	MPI_Barrier(MPI_COMM_WORLD);
 	const double t0 = MPI_Wtime();
@@ -50,7 +55,11 @@ int main(int argc, char* argv[]) {
 
 		}
 
-		usleep(delay_us);
+		#if !BENCH_CSV
+
+			usleep(delay_us);
+
+		#endif
 
 	}
 

@@ -197,7 +197,12 @@ int main(int argc, char* argv[]) {
 
 	const BlockRange range = block_range(SPARSE_ROWS, world_rank, world_size);
 	std::vector<double> local_y(static_cast<size_t>(range.count));
-	const useconds_t delay_scale_percent = sparse_delay_scale_percent();
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_scale_percent = sparse_delay_scale_percent();
+
+	#endif
 
 	for (long local_i = 0; local_i < range.count; local_i++) {
 
@@ -212,10 +217,15 @@ int main(int argc, char* argv[]) {
 
 		}
 
-		const int delay_ms = 4 + nnz / 2;
-		const useconds_t delay_us = static_cast<useconds_t>(delay_ms) * 1000u * delay_scale_percent / 100u;
 		local_y[static_cast<size_t>(local_i)] = acc;
-		usleep(delay_us);
+
+		#if !BENCH_CSV
+
+			const int delay_ms = 4 + nnz / 2;
+			const useconds_t delay_us = static_cast<useconds_t>(delay_ms) * 1000u * delay_scale_percent / 100u;
+			usleep(delay_us);
+
+		#endif
 
 	}
 
@@ -253,15 +263,8 @@ int main(int argc, char* argv[]) {
 
 			if (err > 1e-9) {
 
-				errors++;
-
-				#if !BENCH_CSV
-				if (errors <= 3) {
-
-					std::printf("[CHECK] row=%ld y=%.12f expected=%.12f err=%.3e\n", r, y[r], expected, err);
-
-				}
-				#endif
+				errors = 1;
+				break;
 
 			}
 
